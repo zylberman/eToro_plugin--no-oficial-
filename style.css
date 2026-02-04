@@ -1,0 +1,26 @@
+#etoro-atr-plugin {
+    position: fixed; top: 65px; right: 20px; width: 220px;
+    background: rgba(30, 34, 45, 0.95); border: 1px solid #363a45; border-radius: 8px;
+    color: #d1d4dc; padding: 12px; z-index: 100000; font-family: 'Roboto', sans-serif;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.4);
+}
+.atr-header-row {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 5px; border-bottom: 1px solid #363a45; padding-bottom: 5px;
+}
+.atr-header { font-size: 10px; color: #787b86; text-transform: uppercase; }
+#atr-min-btn { 
+    background: none; border: none; color: #787b86; cursor: pointer; 
+    font-size: 14px; line-height: 1; padding: 0 4px;
+}
+#atr-min-btn:hover { color: white; }
+.input-row { display: flex; gap: 8px; margin-bottom: 10px; margin-top: 10px; }
+label { display: block; font-size: 9px; color: #787b86; margin-bottom: 3px; }
+input { 
+    width: 100%; background: #2a2e39; border: 1px solid #434651; 
+    color: #00ffaa; padding: 3px; border-radius: 4px; font-size: 11px;
+}
+#atr-status { color: #2962ff; font-weight: bold; font-size: 12px; margin-top: 5px;}
+#atr-value { font-size: 22px; font-weight: bold; color: #089981; margin: 8px 0; }
+#atr-cash-value { font-size: 14px; color: #2962ff; font-weight: bold; margin-bottom: 8px; }
+.atr-ohlc { font-size: 10px; color: #787b86; border-top: 1px solid #363a45; padding-top: 8px; }
