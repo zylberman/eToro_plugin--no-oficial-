@@ -1,14 +1,19 @@
 {
   "manifest_version": 3,
   "name": "eToro ATR Assistant",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Calcula el ATR(14) en tiempo real usando datos de Yahoo Finance.",
   "permissions": ["storage"],
   "host_permissions": [
     "https://*.etoro.com/*",
     "https://api.allorigins.win/*",
-    "https://query1.finance.yahoo.com/*"
+    "https://cors-anywhere.com/*",
+    "https://query1.finance.yahoo.com/*",
+    "https://query2.finance.yahoo.com/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://www.etoro.com/*"],

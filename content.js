@@ -113,72 +113,67 @@
      */
     
     const fetchHistory = async (ySymbol, yInterval, range = '5d') => {
-        // Validación de seguridad: Si el símbolo es inválido, no gastamos peticiones
-        if (!ySymbol || ySymbol === 'BREAKDOWN') return [];
-
-        const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ySymbol}?interval=${yInterval}&range=${range}`;
+        if (!ySymbol) return [];
         
+        const indicator = document.getElementById('conn-indicator');
+        const queryHost = Math.random() > 0.5 ? 'query1' : 'query2';
+        const targetUrl = `https://${queryHost}.finance.yahoo.com/v8/finance/chart/${ySymbol}?interval=${yInterval}&range=${range}`;
+
+        const parseChartResult = (data) => {
+            if (!data?.chart?.result?.[0]) return null;
+            const resData = data.chart.result[0];
+            const quotes = resData.indicators.quote[0];
+            const ts = resData.timestamp || [];
+            return ts.map((t, i) => ({
+                t, h: quotes.high[i], l: quotes.low[i], c: quotes.close[i]
+            })).filter(v => v.c !== null);
+        };
+
+        console.log(`%c[ATR] 🌐 Intentando descarga desde ${queryHost}...`, "color: #4fc3f7");
+
+        // 1) Prioridad: usar el background script (sin CORS, más fiable)
+        try {
+            const response = await chrome.runtime.sendMessage({ action: 'fetchYahooChart', url: targetUrl });
+            if (response?.ok && response?.data) {
+                const candles = parseChartResult(response.data);
+                if (candles?.length) {
+                    if (indicator) indicator.style.background = '#00e676';
+                    console.log(`%c[ATR] ✅ Conexión exitosa (background)`, "color: #00e676");
+                    return candles;
+                }
+            }
+        } catch (e) {
+            console.warn('[ATR] Background fetch falló:', e?.message || e);
+        }
+
+        // 2) Fallback: proxies CORS (cors-anywhere.com ~20 req/min)
         const proxyConfigs = [
-            { url: `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}` },
-            { url: `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`, type: 'allorigins' },
-            { url: `https://corsproxy.io/?${encodeURIComponent(targetUrl)}` }
+            { url: `https://cors-anywhere.com/${targetUrl}`, type: 'direct' },
+            { url: `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`, type: 'allorigins' }
         ];
-
-        console.log(`%c[ATR] 🌐 Iniciando descarga para: ${ySymbol}`, "color: cyan");
-
         for (const config of proxyConfigs) {
             try {
-                const startT = performance.now();
                 const res = await fetch(config.url);
-                
-                if (!res.ok) {
-                    console.warn(`[ATR] ❌ Proxy ${config.url.substr(0,20)}... respondió status ${res.status}`);
-                    continue;
-                }
-
-                // BLINDAJE JSON: Leemos como texto primero para evitar el crash "Unexpected token"
-                const textData = await res.text();
-                let json;
-
-                try {
-                    json = JSON.parse(textData);
-                } catch (e) {
-                    console.warn(`[ATR] ⚠️ Respuesta no es JSON válido en ${config.url}. Respuesta: ${textData.substring(0, 50)}...`);
-                    continue; // Saltamos al siguiente proxy
-                }
-
-                // Manejo especial AllOrigins
+                if (!res.ok) continue;
+                let data;
                 if (config.type === 'allorigins') {
-                    if (json.contents) {
-                        try {
-                            json = JSON.parse(json.contents);
-                        } catch (e) { continue; }
-                    } else { continue; }
+                    const outerJson = await res.json();
+                    data = outerJson.contents ? JSON.parse(outerJson.contents) : null;
+                } else {
+                    data = await res.json();
                 }
-
-                if (!json.chart || !json.chart.result || !json.chart.result[0]) {
-                    console.warn(`[ATR] ⚠️ Datos vacíos o error Yahoo.`);
-                    continue;
+                const candles = parseChartResult(data);
+                if (candles?.length) {
+                    if (indicator) indicator.style.background = '#00e676';
+                    console.log(`%c[ATR] ✅ Conexión exitosa (${config.url.split('/')[2]})`, "color: #00e676");
+                    return candles;
                 }
-
-                const resData = json.chart.result[0];
-                const quotes = resData.indicators.quote[0];
-                const ts = resData.timestamp || [];
-
-                if (ts.length === 0) continue;
-
-                console.log(`%c[ATR] ✅ Datos recibidos: ${ts.length} velas.`, "color: lightgreen");
-                
-                return ts.map((t, i) => ({
-                    t: t, h: quotes.high[i], l: quotes.low[i], c: quotes.close[i]
-                })).filter(v => v.c !== null && v.c !== undefined);
-
-            } catch (e) { 
-                console.error(`[ATR] 💥 Error interno proxy: ${e.message}`); 
+            } catch (e) {
+                console.warn(`[ATR] Fallo proxy: ${config.url.split('/')[2]}`);
             }
         }
-        
-        console.error("[ATR] 💀 Todos los proxies fallaron. Revisa tu conexión.");
+
+        if (indicator) indicator.style.background = '#ff5252';
         return [];
     };
 
@@ -281,6 +276,7 @@
     ui.innerHTML = `
         <div class="atr-header-row">
             <div class="atr-header">ATR(14) Assistant</div>
+            <div id="conn-indicator" style="width: 8px; height: 8px; border-radius: 50%; background: #ff5252; margin-left: 5px;" title="Estado de Conexión"></div>
             <div style="display: flex; gap: 5px; align-items: center;">
                 <button id="atr-refresh-btn" class="atr-btn" title="Refrescar Datos">⟳</button>
                 <button id="atr-min-btn">${isMinimized ? '▢' : '_'}</button>
@@ -719,15 +715,20 @@
         }
     });
 
+    // Listener de los botones - ¡Asegúrate de pasar el symbol!
     document.getElementById('k-minus').addEventListener('click', () => {
         if (visibleCyclesCount > 1) { 
             visibleCyclesCount--;
             document.getElementById('k-count-label').innerText = visibleCyclesCount;
-            performCalculations(lastTimeframe);
+            const { symbol } = getMetadata(); // <--- OBTENER SYMBOL
+            performCalculations(lastTimeframe, symbol); // <--- PASAR SYMBOL
         }
     });
 
-    document.getElementById('chk-show-price').addEventListener('change', () => performCalculations(lastTimeframe));
+    document.getElementById('chk-show-price').addEventListener('change', () => {
+        const { symbol } = getMetadata();
+        performCalculations(lastTimeframe, symbol);
+    });
 
     const btnRefresh = document.getElementById('atr-refresh-btn');
     btnRefresh.addEventListener('click', async () => {
