@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "eToro ATR Assistant",
+  "version": "2.2",
+  "description": "Calcula ATR, TP de equilibrio y señales exploratorias Fourier/Haar.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://*.etoro.com/*",
+    "https://api.allorigins.win/*",
+    "https://cors-anywhere.com/*",
+    "https://query1.finance.yahoo.com/*",
+    "https://query2.finance.yahoo.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.etoro.com/*"],
+      "js": ["analytics.js", "content.js"],
+      "css": ["style.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

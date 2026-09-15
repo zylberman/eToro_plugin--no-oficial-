@@ -1,0 +1,183 @@
+#etoro-atr-plugin {
+    position: fixed;
+    top: 65px;
+    right: 20px;
+    width: 790px;
+    box-sizing: border-box;
+    padding: 10px;
+    color: #d1d4dc;
+    background: rgba(24, 28, 38, 0.97);
+    border: 1px solid #3b4050;
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+    font-family: Roboto, Arial, sans-serif;
+    font-size: 11px;
+}
+
+#etoro-atr-plugin * { box-sizing: border-box; }
+.atr-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    min-height: 25px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #363a45;
+    cursor: move;
+}
+.atr-header { color: #a6a9b3; font-size: 11px; font-weight: 700; letter-spacing: .05em; }
+#atr-min-btn {
+    padding: 0 5px;
+    border: 0;
+    color: #a6a9b3;
+    background: transparent;
+    cursor: pointer;
+}
+#atr-min-btn:hover { color: #fff; }
+
+.plugin-grid { display: grid; grid-template-columns: 220px 1fr 1fr; gap: 10px; padding-top: 8px; }
+.plugin-column { min-width: 0; }
+.analysis-column { padding-left: 10px; border-left: 1px solid #363a45; }
+.summary-line, .analysis-head, .time-legend, #trend-summary-legend {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+}
+#atr-status { color: #4f8cff; font-size: 12px; }
+#val-atr { color: #ffdf5d; font-family: monospace; }
+
+.market-price-card {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    margin-top: 8px;
+    padding: 8px;
+    border-radius: 6px;
+    background: #202635;
+}
+.market-price-card > span { color: #a9adba; }
+#current-price { color: #fff; font-size: 14px; font-family: monospace; }
+#price-source { grid-column: 1 / -1; margin-top: 2px; color: #757b89; font-size: 9px; }
+
+.input-row { display: grid; grid-template-columns: 1.35fr 1fr; gap: 7px; margin-top: 8px; }
+#etoro-atr-plugin label { display: block; margin: 0; color: #959aa8; font-size: 9px; }
+#etoro-atr-plugin input[type="number"], #etoro-atr-plugin select {
+    width: 100%;
+    height: 27px;
+    margin-top: 3px;
+    padding: 4px 6px;
+    border: 1px solid #434958;
+    border-radius: 5px;
+    outline: none;
+    color: #20e6a5;
+    background: #292f3d;
+    font-size: 11px;
+}
+
+.cost-panel {
+    margin-top: 8px;
+    padding: 8px;
+    border: 1px solid #3e6658;
+    border-radius: 7px;
+    background: rgba(13, 35, 29, 0.55);
+}
+.cost-title { color: #fff; font-size: 12px; font-weight: 700; }
+#fee-profile { margin: 3px 0 6px; color: #8fd9bc; font-size: 9px; }
+#fee-profile.fee-warning { color: #ffcf70; }
+#breakeven-output { display: grid; gap: 4px; font-family: monospace; }
+#breakeven-output > div { display: grid; grid-template-columns: 50px 1fr auto; align-items: baseline; }
+#breakeven-output span { color: #8a93a3; font-size: 9px; }
+#breakeven-output b { color: #a5ffd9; font-size: 13px; }
+#breakeven-output small { color: #70dcae; }
+#breakeven-output p { margin: 2px 0 0; color: #d7e0dc; font-size: 9px; }
+#breakeven-output.cost-error { color: #ff8a80; }
+.cost-note { margin-top: 6px; color: #858b98; font-size: 8px; line-height: 1.3; }
+.ohlc-title { margin-top: 8px; color: #8c919f; font-size: 9px; }
+.atr-ohlc { margin-top: 3px; color: #aeb3be; font-family: monospace; font-size: 9px; }
+
+.analysis-head { margin-bottom: 6px; }
+.analysis-head > b { color: #fff; font-size: 12px; }
+.analysis-head > span { color: #858b98; font-size: 9px; }
+.chart-title { margin: 5px 0 3px; color: #cdd1da; font-weight: 600; }
+.chart-title small { float: right; color: #737a89; font-size: 8px; font-weight: 400; }
+.reconstruction-title { margin-top: 8px; }
+.wavelet-title { margin-top: 7px; }
+.chart-legend { margin: 3px 0 5px; color: #838997; font-size: 8px; line-height: 1.4; }
+.dot { display: inline-block; width: 6px; height: 6px; margin: 0 3px 0 5px; border-radius: 50%; }
+.dot:first-child { margin-left: 0; }
+.dominant, .real { background: #00e676; }
+.secondary { background: #777; }
+.cycles { background: #4fc3f7; }
+.total { background: #ff5252; }
+.wave-components { background: #b388ff; }
+.wave-total { background: #ffb74d; }
+.reconstruction-legend { display: flex; align-items: center; flex-wrap: wrap; }
+.reconstruction-legend label { display: inline-flex !important; align-items: center; gap: 2px; margin-left: auto !important; }
+.reconstruction-legend input { width: 10px; height: 10px; margin: 0; }
+.time-legend { margin-top: 3px; color: #858b98; font-size: 8px; font-family: monospace; }
+.time-legend b { color: #e1e4e9; }
+.wavelet-legend { display: flex; align-items: center; gap: 3px; }
+.gradient { width: 9px; height: 7px; border-radius: 2px; }
+.gradient.bearish { background: #ff5252; }
+.gradient.neutral { background: #28303c; }
+.gradient.bullish { background: #00e676; }
+.wavelet-scales { margin-left: auto; color: #8b91a0; }
+#w-count-label { min-width: 12px; color: #b388ff; text-align: center; }
+#wavelet-components { min-height: 12px; color: #aa95dd; font-size: 8px; line-height: 1.35; }
+.cycles-toolbar { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: #949aa8; }
+.cycles-toolbar span { margin-right: auto; }
+.atr-btn {
+    padding: 2px 6px;
+    border: 1px solid #485062;
+    border-radius: 4px;
+    color: #fff;
+    background: #2b3241;
+    cursor: pointer;
+}
+.atr-btn:hover { background: #3a4355; }
+#k-count-label { min-width: 12px; color: #4fc3f7; text-align: center; }
+#fourier-top-list { max-height: 38px; overflow-y: auto; color: #61c9f5; font-size: 8px; }
+.trade-plan-panel { margin-top: 8px; padding: 7px; border: 1px solid #3d4d61; border-radius: 6px; background: rgba(25, 35, 49, .72); }
+.trade-plan-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 6px; color: #e2e9f2; font-size: 10px; }
+#trade-plan-side { width: 76px !important; height: 23px !important; margin: 0 !important; padding: 2px 4px !important; }
+#trade-plan-output { display: grid; gap: 3px; }
+.plan-level { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 4px; padding-bottom: 2px; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 8px; }
+.plan-level span { color: #929baa; }
+.plan-level b { color: #fff; font-family: monospace; font-size: 10px; }
+.plan-level small { grid-column: 1 / -1; color: #798493; text-align: right; font-family: monospace; }
+.plan-level.target b { color: #55e8a2; }
+.plan-level.stop b { color: #ff7d7d; }
+.plan-level.minimum b { color: #ffd166; }
+.plan-section-label { margin-top: 3px; padding: 2px 0; color: #b4bdca; font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+.plan-alert { padding: 3px 4px; border-radius: 3px; font-size: 8px; line-height: 1.3; }
+.plan-alert.ok { color: #8ff0bc; background: rgba(0, 170, 95, .12); }
+.plan-alert.bad, .plan-warning { color: #ffad9f; background: rgba(210, 65, 52, .12); }
+.trade-plan-note { margin-top: 5px; color: #737d8b; font-size: 7px; line-height: 1.3; }
+#trend-summary-legend {
+    align-items: stretch;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid #363a45;
+}
+#trend-summary-legend > span { display: grid; gap: 2px; color: #818795; font-size: 8px; }
+#trend-summary-legend b { color: #fff; font-size: 9px; }
+.levels-panel { display: grid; gap: 4px; margin-top: 7px; padding-top: 6px; border-top: 1px solid #363a45; }
+.levels-panel > span, .levels-panel > div:not(.levels-title) { display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; color: #818795; font-size: 8px; }
+.levels-title { color: #d8cbf3; font-size: 9px; font-weight: 700; }
+.levels-panel b { color: #d4b5ff; text-align: right; }
+#calibration-status { margin-top: 7px; color: #8690a0; font-size: 8px; line-height: 1.35; }
+.model-info-panel { margin-top: 8px; padding: 7px; border: 1px solid #46405b; border-radius: 6px; background: rgba(37, 29, 54, .55); }
+.model-info-title { margin-bottom: 5px; color: #e8ddff; font-size: 10px; font-weight: 700; }
+.equation-line { margin: 3px 0; color: #9690a4; font-family: monospace; font-size: 7.5px; line-height: 1.35; }
+.equation-line b { color: #cbb5ff; }
+#model-parameters { margin-top: 6px; padding: 4px; border-radius: 4px; color: #d8cbf3; background: #242031; font-family: monospace; font-size: 8px; line-height: 1.4; }
+.split-grid { display: grid; grid-template-columns: 1fr; gap: 3px; margin-top: 6px; }
+.split-grid span { display: flex; justify-content: space-between; color: #8d8798; font-size: 8px; }
+.split-grid b { color: #fff; }
+#calibration-updated { margin-top: 3px; color: #777181; font-size: 7.5px; }
+
+@media (max-width: 650px) {
+    #etoro-atr-plugin { width: min(94vw, 790px); }
+    .plugin-grid { grid-template-columns: 1fr; }
+    .analysis-column { padding: 8px 0 0; border-left: 0; border-top: 1px solid #363a45; }
+}
