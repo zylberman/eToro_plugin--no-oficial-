@@ -310,7 +310,7 @@
    ======================================================================== */
     ui.innerHTML = `
         <div class="atr-header-row">
-            <div class="atr-header">ATR(14) Assistant</div>
+            <div class="atr-brand"><img src="${chrome.runtime.getURL('icons/icon32.png')}" alt=""><div class="atr-header">ATR(14) Assistant</div></div>
             <div id="conn-indicator" style="width: 8px; height: 8px; border-radius: 50%; background: #ff5252; margin-left: 5px;" title="Estado de Conexión"></div>
             <div style="display: flex; gap: 5px; align-items: center;">
                 <button id="atr-refresh-btn" class="atr-btn" title="Refrescar Datos">⟳</button>
@@ -357,8 +357,10 @@
                     </div>
                     <div class="levels-panel">
                         <div class="levels-title">Soportes y resistencias Wavelet</div>
-                        <div><span>Soportes</span><b id="wavelet-supports">--</b></div>
-                        <div><span>Resistencias</span><b id="wavelet-resistances">--</b></div>
+                        <div class="wavelet-zone-columns">
+                            <label>Soportes<select id="wavelet-supports"><option>--</option></select></label>
+                            <label>Resistencias<select id="wavelet-resistances"><option>--</option></select></label>
+                        </div>
                         <div><span>ATR actual</span><b id="current-atr-distance">--</b></div>
                         <div><span>SL recomendado</span><b id="recommended-atr">--</b></div>
                         <span>Combinación <b id="combined-score">--</b></span>
@@ -395,6 +397,20 @@
                         <button id="k-plus" class="atr-btn">+</button>
                     </div>
                     <div id="fourier-top-list"></div>
+                </section>
+
+                <section class="plugin-column analysis-column forecast-column">
+                    <div class="analysis-head">
+                        <b>Proyección y operación</b>
+                        <span>Horizonte 12 h</span>
+                    </div>
+                    <div class="chart-title reconstruction-title">Trayectoria Fourier futura</div>
+                    <canvas id="fourier-forecast-canvas" width="240" height="62"></canvas>
+                    <div id="fourier-forecast-output" class="forecast-output">Esperando proyección…</div>
+                    <div class="simulation-panel">
+                        <button id="trend-simulation-btn" class="atr-btn">Simular log-precio vs Fourier ×5</button>
+                        <div id="trend-simulation-output">Usa las velas ya cargadas y predice únicamente la vela siguiente.</div>
+                    </div>
                     <div class="trade-plan-panel">
                         <div class="trade-plan-head">
                             <b>TP / SL mínimos válidos</b>
@@ -448,12 +464,16 @@
     `;
 
     // --- Inyección en el DOM ---
-    Object.assign(ui.style, {
-        position: 'fixed', top: '100px', right: '20px', zIndex: '10000',
-        width: '790px', background: 'transparent', userSelect: 'none'
-    });
+    Object.assign(ui.style, { position: 'fixed', top: '100px', right: '20px', zIndex: '10000' });
+    ui.classList.toggle('atr-minimized', isMinimized);
 
     document.body.appendChild(ui);
+    const savedPluginPosition = JSON.parse(localStorage.getItem('atr-plugin-position') || 'null');
+    if (savedPluginPosition && Number.isFinite(savedPluginPosition.left) && Number.isFinite(savedPluginPosition.top)) {
+        ui.style.left = `${Math.max(0, Math.min(savedPluginPosition.left, window.innerWidth - 60))}px`;
+        ui.style.top = `${Math.max(0, Math.min(savedPluginPosition.top, window.innerHeight - 35))}px`;
+        ui.style.right = 'auto';
+    }
 
     const readNumber = id => Number(document.getElementById(id)?.value || 0);
     const priceDecimals = price => price < 10 ? 5 : price < 100 ? 4 : 2;
@@ -507,18 +527,19 @@
         const entryPrice = side === 'long'
             ? (lastAskPrice || lastMarketPrice)
             : (lastBidPrice || lastMarketPrice);
+        const minimumZoneDistance = lastAtrValue * 1.50;
         const supports = lastCombinedAnalysis.zones.supports
-            .filter(zone => zone.low < entryPrice)
+            .filter(zone => entryPrice - zone.high > minimumZoneDistance)
             .sort((a, b) => b.low - a.low);
         const resistances = lastCombinedAnalysis.zones.resistances
-            .filter(zone => zone.high > entryPrice)
+            .filter(zone => zone.low - entryPrice > minimumZoneDistance)
             .sort((a, b) => a.high - b.high);
-        const result = window.EToroAnalytics.calculateTradePlan({
+        const result = window.EToroAnalytics.calculateBestZoneTradePlan({
             side, entryPrice,
             investment: readNumber('inv-amount'), leverage,
             atr: lastAtrValue,
-            support: supports[0],
-            resistance: resistances[0],
+            supports: supports.slice(0, 4),
+            resistances: resistances.slice(0, 4),
             openFeePercent: fee.openFeePercent,
             stopBufferAtr: 0.10,
             recommendedAtrMultiple: 1.50,
@@ -528,18 +549,20 @@
             output.innerHTML = `<div class="plan-warning">${result.error}</div>`;
             return;
         }
+        const plan = result.best;
         const decimals = priceDecimals(entryPrice);
-        const allValid = result.targetFartherThanStop && result.targetCoversTwiceOpening && result.stopExceedsAtr;
+        const targetReference = plan.targetIndex ? ` · ${side === 'long' ? 'R' : 'S'}${plan.targetIndex}` : ' · respaldo';
+        const stopReference = plan.stopIndex ? ` · ${side === 'long' ? 'S' : 'R'}${plan.stopIndex}` : ' · ATR';
+        const fallbackNotice = result.fallback
+            ? `<div class="plan-alert bad">⚠ ${result.reason} TP de respaldo = ${plan.rewardRisk.toFixed(2)} × SL.</div>`
+            : `<div class="plan-alert ok">✓ ${result.validCount}/${result.totalCount} combinaciones válidas; elegida por R/R (70%) y fuerza Wavelet (30%)</div>`;
         output.innerHTML = `
             <div class="plan-level"><span>Entrada ${side === 'long' ? 'COMPRA' : 'VENTA'}</span><b>${entryPrice.toFixed(decimals)}</b></div>
-            <div class="plan-level target"><span>TP mínimo válido</span><b>${result.minimumTarget.toFixed(decimals)}</b><small>Δ ${result.targetDistance.toFixed(decimals)} · ${result.targetPercent.toFixed(2)}% · +$${result.potentialProfit.toFixed(2)}</small></div>
-            <div class="plan-level stop"><span>SL mínimo válido</span><b>${result.technicalStop.toFixed(decimals)}</b><small>Δ ${result.stopDistance.toFixed(decimals)} · ${result.stopPercent.toFixed(2)}% · −$${result.potentialLoss.toFixed(2)}</small></div>
-            <div class="plan-level minimum"><span>Objetivo Wavelet cercano</span><b>${result.technicalTarget.toFixed(decimals)}</b><small>Espacio ${result.technicalTargetDistance.toFixed(decimals)} · R/R mínimo ${result.rewardRisk.toFixed(2)}</small></div>
-            <div class="plan-alert ${result.targetFartherThanStop ? 'ok' : 'bad'}">${result.targetFartherThanStop ? '✓' : '⚠'} Distancia TP &gt; distancia SL</div>
-            <div class="plan-alert ${result.targetCoversTwiceOpening ? 'ok' : 'bad'}">${result.targetCoversTwiceOpening ? '✓' : '⚠'} Beneficio TP &gt; 2× apertura ($${result.minimumProfit.toFixed(2)})</div>
-            <div class="plan-alert ${result.stopExceedsAtr ? 'ok' : 'bad'}">${result.stopExceedsAtr ? '✓' : '⚠'} Distancia SL &gt; ATR recomendado (${result.recommendedAtrMultiple.toFixed(2)}×)</div>
-            <div class="plan-alert ${result.technicalRoomIsEnough ? 'ok' : 'bad'}">${result.technicalRoomIsEnough ? '✓ La zona Wavelet permite el TP' : '⚠ La resistencia/soporte llega antes del TP mínimo'}</div>
-            <div class="plan-alert ${allValid ? 'ok' : 'bad'}">${allValid ? '✓ Plan mínimo cumple las tres reglas' : '⚠ Plan incompleto'}</div>`;
+            <div class="plan-level target"><span>TP elegido${targetReference}</span><b>${plan.technicalTarget.toFixed(decimals)}</b><small>Δ ${plan.targetDistance.toFixed(decimals)} · ${plan.targetPercent.toFixed(2)}% · +$${plan.potentialProfit.toFixed(2)}</small></div>
+            <div class="plan-level stop"><span>SL elegido${stopReference}</span><b>${plan.technicalStop.toFixed(decimals)}</b><small>Δ ${plan.stopDistance.toFixed(decimals)} · ${plan.stopPercent.toFixed(2)}% · −$${plan.potentialLoss.toFixed(2)}</small></div>
+            <div class="plan-level minimum"><span>Mejor combinación</span><b>R/R ${plan.rewardRisk.toFixed(2)}</b><small>Fuerza TP ${(plan.targetStrength * 100).toFixed(0)}% · SL ${(plan.stopStrength * 100).toFixed(0)}%</small></div>
+            <div class="plan-alert ok">✓ TP &gt; SL · beneficio &gt; $${plan.minimumProfit.toFixed(2)} · SL &gt; ${plan.recommendedAtrMultiple.toFixed(2)} ATR</div>
+            ${fallbackNotice}`;
     };
 
     const refreshEtoroQuotes = () => {
@@ -744,6 +767,57 @@
         drawLine(signalTrended, '#ff5252', 1.5);             // Roja: Reconstrucción Total
     }
 
+    function drawFourierForecast(result, atr, longTarget, shortTarget, minutesPerBar) {
+        const canvas = document.getElementById('fourier-forecast-canvas');
+        const output = document.getElementById('fourier-forecast-output');
+        if (!canvas || !output || !result?.ok) return;
+        const ctx = canvas.getContext('2d');
+        const levels = [result.current + atr, result.current - atr];
+        if (Number.isFinite(longTarget)) levels.push(longTarget);
+        if (Number.isFinite(shortTarget)) levels.push(shortTarget);
+        const all = [...result.forecast, ...levels];
+        const min = Math.min(...all);
+        const max = Math.max(...all);
+        const range = max - min || 1;
+        const x = index => index / Math.max(1, result.forecast.length - 1) * canvas.width;
+        const y = value => canvas.height - (value - min) / range * canvas.height;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#11151d';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const level = (value, color, label) => {
+            ctx.save();
+            ctx.strokeStyle = color;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(0, y(value)); ctx.lineTo(canvas.width, y(value)); ctx.stroke();
+            ctx.fillStyle = color; ctx.font = '7px monospace'; ctx.fillText(label, 3, Math.max(7, y(value) - 2));
+            ctx.restore();
+        };
+        level(result.current + atr, '#ffd166', '+ATR');
+        level(result.current - atr, '#ffd166', '-ATR');
+        if (Number.isFinite(longTarget)) level(longTarget, '#55e8a2', 'TP compra');
+        if (Number.isFinite(shortTarget)) level(shortTarget, '#ff7d7d', 'TP venta');
+        ctx.strokeStyle = '#4fc3f7'; ctx.lineWidth = 1.6; ctx.beginPath();
+        result.forecast.forEach((value, index) => index ? ctx.lineTo(x(index), y(value)) : ctx.moveTo(x(index), y(value)));
+        ctx.stroke();
+        const duration = bars => {
+            const totalMinutes = bars * minutesPerBar;
+            return totalMinutes < 60 ? `${totalMinutes} min` : `${(totalMinutes / 60).toFixed(totalMinutes % 60 ? 1 : 0)} h`;
+        };
+        let status;
+        if (result.winner) {
+            const label = result.winner.direction === 'up' ? 'ALCISTA' : 'BAJISTA';
+            status = `<b class="${result.winner.direction === 'up' ? 'cycle-up' : 'cycle-down'}">${label}</b> · ATR en ${duration(result.winner.atrBar)} · TP en ${duration(result.winner.targetBar)}`;
+        } else if (result.upAtrBar !== null || result.downAtrBar !== null) {
+            const direction = result.upAtrBar !== null && (result.downAtrBar === null || result.upAtrBar < result.downAtrBar) ? 'ALCISTA' : 'BAJISTA';
+            const bar = direction === 'ALCISTA' ? result.upAtrBar : result.downAtrBar;
+            status = `<b class="cycle-turning">${direction}: ATR en ${duration(bar)}, TP no alcanzado</b>`;
+        } else {
+            status = '<b class="cycle-turning">SIN CONFIRMACIÓN: no supera 1 ATR</b>';
+        }
+        const cycles = result.cycleDirections.map(item => `K${item.k}`).join(', ');
+        output.innerHTML = `${status}<small>${result.harmonics} ciclos: ${cycles} · alineación ${(result.alignment * 100).toFixed(0)}%${result.ambiguous ? ' · ⚠ ambas direcciones alcanzan TP' : ''}</small>`;
+    }
+
     function waveletDraw(prices) {
         const canvas = document.getElementById('wavelet-canvas');
         if (!canvas || !window.EToroAnalytics) return;
@@ -790,7 +864,13 @@
         return list.map((item, i) => {
             const p = N_val / item.k;
             const label = isTop ? `Ciclo ${i + 1}` : `Frecuencia ${item.k}`;
-            return `<div><span style="color:${color}">${label}</span> · período aproximado <b>${p.toFixed(1)} velas</b></div>`;
+            const phase = window.EToroAnalytics.fourierComponentDirection(item, N_val);
+            const direction = phase.direction === 'up'
+                ? { label: 'ALCISTA', arrow: '▲', css: 'cycle-up' }
+                : phase.direction === 'down'
+                    ? { label: 'BAJISTA', arrow: '▼', css: 'cycle-down' }
+                    : { label: 'GIRO/LATERAL', arrow: '◆', css: 'cycle-turning' };
+            return `<div class="fourier-cycle-row"><span style="color:${color}">${label}</span><b>${p.toFixed(1)} velas</b><strong class="${direction.css}" title="Dirección de fase estimada para la próxima vela">${direction.arrow} ${direction.label}</strong></div>`;
         }).join('');
     };
 
@@ -832,7 +912,12 @@
             // Magnitudes y Ciclo Dominante
             const magnitudes = [];
             for (let k = 1; k < N / 2; k++) {
-                magnitudes.push({ k, mag: Math.sqrt(spectrum[k].real ** 2 + spectrum[k].imag ** 2) });
+                magnitudes.push({
+                    k,
+                    mag: Math.sqrt(spectrum[k].real ** 2 + spectrum[k].imag ** 2),
+                    real: spectrum[k].real,
+                    imag: spectrum[k].imag
+                });
             }
 
             const topVisible = [...magnitudes].sort((a, b) => b.mag - a.mag).slice(0, visibleCyclesCount);
@@ -885,22 +970,22 @@
             }
 
             const currentPrice = prices.at(-1);
+            const recommendedAtrDistance = atrValue * 1.5;
             const sortedSupports = [...combined.zones.supports]
-                .filter(zone => zone.low < currentPrice)
+                .filter(zone => currentPrice - zone.high > recommendedAtrDistance)
                 .sort((a, b) => Math.abs(a.center - currentPrice) - Math.abs(b.center - currentPrice));
             const sortedResistances = [...combined.zones.resistances]
-                .filter(zone => zone.high > currentPrice)
+                .filter(zone => zone.low - currentPrice > recommendedAtrDistance)
                 .sort((a, b) => Math.abs(a.center - currentPrice) - Math.abs(b.center - currentPrice));
-            const zoneLabel = zone => {
+            const zoneOption = (zone, index, prefix) => {
                 const decimals = priceDecimals(zone.center);
-                return `${zone.low.toFixed(decimals)}–${zone.high.toFixed(decimals)} · Δ${Math.abs(zone.center - currentPrice).toFixed(decimals)} · ${(zone.strength * 100).toFixed(0)}%`;
+                return `<option>${prefix}${index + 1} · ${zone.low.toFixed(decimals)}–${zone.high.toFixed(decimals)} · Δ${Math.abs(zone.center - currentPrice).toFixed(decimals)} · ${(zone.strength * 100).toFixed(0)}%</option>`;
             };
             document.getElementById('wavelet-supports').innerHTML = sortedSupports.length
-                ? sortedSupports.slice(0, 3).map(zoneLabel).join('<br>') : '--';
+                ? sortedSupports.slice(0, 4).map((zone, index) => zoneOption(zone, index, 'S')).join('') : '<option>Sin soporte &gt; 1,50 ATR</option>';
             document.getElementById('wavelet-resistances').innerHTML = sortedResistances.length
-                ? sortedResistances.slice(0, 3).map(zoneLabel).join('<br>') : '--';
+                ? sortedResistances.slice(0, 4).map((zone, index) => zoneOption(zone, index, 'R')).join('') : '<option>Sin resistencia &gt; 1,50 ATR</option>';
             const atrDecimals = priceDecimals(currentPrice);
-            const recommendedAtrDistance = atrValue * 1.5;
             const exposureUnits = (readNumber('inv-amount') * readNumber('lev-amount')) / currentPrice;
             document.getElementById('current-atr-distance').innerText = `${atrValue.toFixed(atrDecimals)} · ${(atrValue / currentPrice * 100).toFixed(2)}%`;
             document.getElementById('recommended-atr').innerText = `1,50 ATR = ${recommendedAtrDistance.toFixed(atrDecimals)} · $${(exposureUnits * recommendedAtrDistance).toFixed(2)}`;
@@ -918,6 +1003,38 @@
             fourierDraw(magnitudes.map(m => m.mag), domK - 1);
             reconstructionDraw(spectrum, topVisible, N, sample);
             waveletDraw(prices);
+            const timeframeMinutes = (() => {
+                const normalized = String(timeframe).toLowerCase();
+                const amount = parseFloat(normalized) || 1;
+                if (normalized.includes('d')) return amount * 1440;
+                if (normalized.includes('h')) return amount * 60;
+                return amount;
+            })();
+            const leverage = readNumber('lev-amount');
+            const investment = readNumber('inv-amount');
+            const fee = window.EToroAnalytics.getEtoroFeeProfile(lastSymbol, leverage);
+            const planFor = side => window.EToroAnalytics.calculateBestZoneTradePlan({
+                side,
+                entryPrice: side === 'long' ? (lastAskPrice || currentPrice) : (lastBidPrice || currentPrice),
+                investment, leverage, atr: atrValue,
+                supports: combined.zones.supports,
+                resistances: combined.zones.resistances,
+                openFeePercent: fee.openFeePercent,
+                stopBufferAtr: 0.10,
+                recommendedAtrMultiple: 1.50,
+                openingCostMultiple: 2
+            });
+            const longPlan = planFor('long');
+            const shortPlan = planFor('short');
+            const longTarget = longPlan.ok ? longPlan.best.technicalTarget : Infinity;
+            const shortTarget = shortPlan.ok ? shortPlan.best.technicalTarget : -Infinity;
+            const futureProjection = window.EToroAnalytics.projectFourierToTargets(prices, atrValue, {
+                harmonics: visibleCyclesCount,
+                horizonBars: Math.max(1, Math.ceil(720 / timeframeMinutes)),
+                longTarget,
+                shortTarget
+            });
+            drawFourierForecast(futureProjection, atrValue, longTarget, shortTarget, timeframeMinutes);
             updateTradePlan();
         } catch (e) {
             console.error(`[ATR] 💥 Error en cálculos: ${e.message}`);
@@ -975,7 +1092,7 @@
             
             isSyncing = false;
             performCalculations(timeframe, symbol); // <--- AHORA PASAMOS EL SÍMBOLO
-            calibrateHistoricalModel(symbol, timeframe, candlesHistory.map(candle => candle.c));
+            await calibrateHistoricalModel(symbol, timeframe, candlesHistory.map(candle => candle.c), 'actualización completa');
         }
 
         refreshEtoroQuotes();
@@ -1053,39 +1170,67 @@
     }; 
 
     // --- Lógica de Arrastre (Drag & Drop) ---
-    const header = ui.querySelector('.atr-header-row');
     let isDragging = false;
     let offsetX, offsetY;
 
-    header.addEventListener('mousedown', (e) => {
+    const canStartDrag = e => {
+        if (e.button !== 0 || e.target.closest('button, input, select, option, label, canvas, a')) return false;
+        const rect = ui.getBoundingClientRect();
+        const edgeSize = 10;
+        const onBorder = e.clientX - rect.left <= edgeSize
+            || rect.right - e.clientX <= edgeSize
+            || e.clientY - rect.top <= edgeSize
+            || rect.bottom - e.clientY <= edgeSize;
+        const inHeader = Boolean(e.target.closest('.atr-header-row'));
+        const freeArea = e.target === ui || e.target.matches(
+            '#atr-content-body, .plugin-grid, .plugin-column, .analysis-head, .summary-line, .levels-panel, .trade-plan-panel, .model-info-panel'
+        );
+        return onBorder || inHeader || freeArea;
+    };
+
+    ui.addEventListener('pointerdown', e => {
+        if (!canStartDrag(e)) return;
         isDragging = true;
-        // Calculamos el desfase inicial
         offsetX = e.clientX - ui.getBoundingClientRect().left;
         offsetY = e.clientY - ui.getBoundingClientRect().top;
-        ui.style.cursor = 'grabbing';
+        ui.classList.add('is-dragging');
+        ui.setPointerCapture?.(e.pointerId);
+        e.preventDefault();
     });
 
-    document.addEventListener('mousemove', (e) => {
+    document.addEventListener('pointermove', e => {
         if (!isDragging) return;
-        
-        // Posicionamos el plugin respecto al mouse
-        ui.style.left = (e.clientX - offsetX) + 'px';
-        ui.style.top = (e.clientY - offsetY) + 'px';
-        ui.style.right = 'auto'; // Anulamos el 'right' inicial de inyección
+        const maxLeft = Math.max(0, window.innerWidth - Math.min(60, ui.offsetWidth));
+        const maxTop = Math.max(0, window.innerHeight - Math.min(35, ui.offsetHeight));
+        ui.style.left = `${Math.max(0, Math.min(e.clientX - offsetX, maxLeft))}px`;
+        ui.style.top = `${Math.max(0, Math.min(e.clientY - offsetY, maxTop))}px`;
+        ui.style.right = 'auto';
     });
 
-    document.addEventListener('mouseup', () => {
+    const finishDragging = () => {
+        if (!isDragging) return;
         isDragging = false;
-        ui.style.cursor = 'default';
-    });
+        ui.classList.remove('is-dragging');
+        const rect = ui.getBoundingClientRect();
+        localStorage.setItem('atr-plugin-position', JSON.stringify({ left: rect.left, top: rect.top }));
+    };
+    document.addEventListener('pointerup', finishDragging);
+    document.addEventListener('pointercancel', finishDragging);
 
     // --- Listeners de Eventos (UI) ---
     document.getElementById('atr-min-btn').addEventListener('click', () => {
         const body = document.getElementById('atr-content-body');
         const isHidden = body.style.display === 'none';
         body.style.display = isHidden ? 'block' : 'none';
+        ui.classList.toggle('atr-minimized', !isHidden);
         document.getElementById('atr-min-btn').innerText = isHidden ? '_' : '▢';
         localStorage.setItem('atr-plugin-minimized', !isHidden);
+        if (isHidden) requestAnimationFrame(() => {
+            const rect = ui.getBoundingClientRect();
+            ui.style.left = `${Math.max(0, Math.min(rect.left, window.innerWidth - ui.offsetWidth))}px`;
+            ui.style.top = `${Math.max(0, Math.min(rect.top, window.innerHeight - 35))}px`;
+            ui.style.right = 'auto';
+        });
     });
 
     document.getElementById('k-plus').addEventListener('click', () => {
@@ -1095,6 +1240,24 @@
             const { symbol } = getMetadata();
             performCalculations(lastTimeframe, symbol); // <--- Llamada 3: Añadir symbol
         }
+    });
+
+    document.getElementById('trend-simulation-btn').addEventListener('click', () => {
+        const output = document.getElementById('trend-simulation-output');
+        const leverage = readNumber('lev-amount');
+        const fee = window.EToroAnalytics.getEtoroFeeProfile(lastSymbol, leverage);
+        const barsPerYearByTimeframe = { '1m': 60 * 24 * 252, '5m': 12 * 24 * 252, '15m': 4 * 24 * 252, '30m': 2 * 24 * 252, '1h': 24 * 252, '4h': 6 * 252, '1d': 252 };
+        const result = window.EToroAnalytics.compareTrendMethods(
+            candlesHistory.map(candle => candle.c),
+            { harmonics: 5, feePercent: fee.openFeePercent, barsPerYear: barsPerYearByTimeframe[lastTimeframe] || 24 * 252 }
+        );
+        if (!result.ok) {
+            output.innerHTML = `<span class="plan-warning">${result.error}</span>`;
+            return;
+        }
+        const row = (name, data) => `<div><b>${name}</b><span>Acierto ${(data.accuracy * 100).toFixed(1)}%</span><span>Ret. ${(data.return * 100).toFixed(1)}%</span><span>DD ${(data.maxDrawdown * 100).toFixed(1)}%</span><span>Sharpe ${data.sharpe.toFixed(2)}</span></div>`;
+        output.innerHTML = row('Log 16', result.logPrice) + row('Fourier ×5', result.fourier5)
+            + `<small>${result.logPrice.observations} predicciones · coste ${result.feePercent.toFixed(3)}% por lado · walk-forward</small>`;
     });
 
     // Listener de los botones - ¡Asegúrate de pasar el symbol!
@@ -1131,19 +1294,49 @@
     const btnRefresh = document.getElementById('atr-refresh-btn');
     btnRefresh.addEventListener('click', async () => {
         console.log("[ATR] 🖱️ Usuario solicitó actualización manual.");
-        if (isSyncing) return; // Evitar doble clic
-        
-        // Feedback visual (Animación)
-        btnRefresh.classList.add('spinning'); 
-        
-        // Truco clínico: Borramos el 'lastSymbol' para engañar a la función monitor
-        // y obligarla a pensar que es un activo nuevo, forzando la descarga.
-        lastSymbol = null; 
+        if (isSyncing) return;
+        btnRefresh.classList.add('spinning');
+        btnRefresh.disabled = true;
+        document.getElementById('atr-status').innerText = 'Actualizando todo…';
+        document.getElementById('fourier-cycle').innerText = 'Actualizando…';
+        document.getElementById('fourier-forecast-output').innerText = 'Reconstruyendo proyección…';
+        document.getElementById('trade-plan-output').innerText = 'Recalculando TP / SL…';
+        document.getElementById('wavelet-components').innerText = 'Reconstruyendo Wavelet…';
+        document.getElementById('calibration-status').innerText = 'Recalculando constantes…';
+        ['fourier-canvas', 'reconstruction-canvas', 'fourier-forecast-canvas', 'wavelet-canvas'].forEach(id => {
+            const canvas = document.getElementById(id);
+            canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+        });
+        calibrationToken++;
+        lastSymbol = null;
+        lastTimeframe = null;
         candlesHistory = [];
-        
-        await monitor(); // Ejecutamos la carga manualmente
-        await calibrateHistoricalModel(lastSymbol, lastTimeframe, candlesHistory.map(candle => candle.c), 'botón actualizar');
-        btnRefresh.classList.remove('spinning'); // Quitamos animación
+        lastBarTime = 0;
+        lastClose = null;
+        lastMarketPrice = null;
+        lastBidPrice = null;
+        lastAskPrice = null;
+        lastCombinedAnalysis = null;
+        lastAtrValue = null;
+        historyAlignedToEtoro = false;
+        try {
+            await monitor();
+            if (!lastSymbol || !lastTimeframe || !candlesHistory.length) {
+                throw new Error('No se pudo cargar el historial del activo actual.');
+            }
+            refreshEtoroQuotes();
+            performCalculations(lastTimeframe, lastSymbol);
+            updateBreakEven();
+            updateTradePlan();
+            document.getElementById('trend-simulation-btn').click();
+        } catch (error) {
+            document.getElementById('atr-status').innerText = 'Error al actualizar';
+            document.getElementById('calibration-status').innerText = error.message;
+            console.error('[ATR] Actualización completa fallida:', error);
+        } finally {
+            btnRefresh.classList.remove('spinning');
+            btnRefresh.disabled = false;
+        }
     });
 
     // Lanzamiento

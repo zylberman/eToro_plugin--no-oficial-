@@ -1,7 +1,9 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateMultiLevelTradePlan, estimateTrendBreak,
+    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateMultiLevelTradePlan,
+    calculateBestZoneTradePlan, fourierComponentDirection, compareTrendMethods,
+    projectFourierToTargets, estimateTrendBreak,
     haarTransitionScore, haarScalogram, haarDecompose,
     haarReconstruct, haarWaveletAnalysis, findWaveletZones,
     analyzeCombined, calibrateCombinedModel
@@ -86,6 +88,40 @@ test('minimum plan strictly satisfies ATR, distance and opening-cost rules', () 
     assert.equal(result.targetFartherThanStop, true);
     assert.equal(result.targetCoversTwiceOpening, true);
     assert.equal(result.stopExceedsAtr, true);
+});
+
+test('best zone plan ignores levels inside recommended ATR and selects a valid pair', () => {
+    const result = calculateBestZoneTradePlan({
+        side: 'long', entryPrice: 100, investment: 1000, leverage: 1, atr: 2,
+        supports: [
+            { low: 98, high: 99, center: 98.5, strength: 1 },
+            { low: 94, high: 95, center: 94.5, strength: 0.8 }
+        ],
+        resistances: [
+            { low: 102, high: 103, center: 102.5, strength: 1 },
+            { low: 108, high: 109, center: 108.5, strength: 0.8 }
+        ],
+        openFeePercent: 0.15, recommendedAtrMultiple: 1.5
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.supports.length, 1);
+    assert.equal(result.resistances.length, 1);
+    assert.ok(100 - result.supports[0].high > 3);
+    assert.ok(result.resistances[0].low - 100 > 3);
+    assert.ok(result.best.targetDistance > result.best.stopDistance);
+});
+
+test('missing Wavelet side falls back to a TP at least 1.5 times the SL', () => {
+    const result = calculateBestZoneTradePlan({
+        side: 'long', entryPrice: 100, investment: 1000, leverage: 1, atr: 2,
+        supports: [{ low: 94, high: 95, center: 94.5, strength: 0.8 }],
+        resistances: [], openFeePercent: 0.15, recommendedAtrMultiple: 1.5
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.fallback, true);
+    assert.ok(result.best.stopDistance > 3);
+    assert.ok(result.best.targetDistance >= result.best.stopDistance * 1.5);
+    assert.ok(result.best.potentialProfit > result.best.minimumProfit);
 });
 
 test('multi-level long plan orders several targets and stops by proximity', () => {
@@ -190,4 +226,37 @@ test('trend-break estimator returns a bounded exploratory forecast', () => {
     assert.equal(result.ok, true);
     assert.equal(result.forecast.length, 25);
     if (result.candidate) assert.ok(result.candidate.bars >= 2 && result.candidate.bars <= 23);
+});
+
+test('Fourier component direction follows its phase into the next candle', () => {
+    const falling = fourierComponentDirection({ k: 1, real: 64, imag: 0 }, 128, 32);
+    const rising = fourierComponentDirection({ k: 1, real: 64, imag: 0 }, 128, 96);
+    const turning = fourierComponentDirection({ k: 1, real: 64, imag: 0 }, 128, 0);
+    assert.equal(falling.direction, 'down');
+    assert.equal(rising.direction, 'up');
+    assert.equal(turning.direction, 'turning');
+});
+
+test('trend-method simulation is causal and returns comparable bounded metrics', () => {
+    const prices = Array.from({ length: 300 }, (_, i) => 100 + i * 0.01 + Math.sin(2 * Math.PI * i / 24));
+    const result = compareTrendMethods(prices, { harmonics: 5, feePercent: 0.03 });
+    assert.equal(result.ok, true);
+    assert.equal(result.logPrice.observations, result.fourier5.observations);
+    for (const method of [result.logPrice, result.fourier5]) {
+        assert.ok(method.accuracy >= 0 && method.accuracy <= 1);
+        assert.ok(method.maxDrawdown >= 0 && method.maxDrawdown <= 1);
+        assert.ok(Number.isFinite(method.return));
+    }
+});
+
+test('Fourier future projection is anchored and bounded to the requested horizon', () => {
+    const prices = Array.from({ length: 128 }, (_, i) => 100 + i * 0.03 + Math.sin(2 * Math.PI * i / 24));
+    const result = projectFourierToTargets(prices, 0.5, {
+        harmonics: 5, horizonBars: 24, longTarget: 105, shortTarget: 98
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.forecast.length, 25);
+    assert.ok(Math.abs(result.forecast[0] - prices.at(-1)) < 1e-9);
+    assert.equal(result.cycleDirections.length, 5);
+    assert.ok(result.alignment >= 0 && result.alignment <= 1);
 });

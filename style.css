@@ -2,7 +2,7 @@
     position: fixed;
     top: 65px;
     right: 20px;
-    width: 790px;
+    width: min(1080px, calc(100vw - 24px));
     box-sizing: border-box;
     padding: 10px;
     color: #d1d4dc;
@@ -12,7 +12,19 @@
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
     font-family: Roboto, Arial, sans-serif;
     font-size: 11px;
+    touch-action: none;
 }
+
+#etoro-atr-plugin.is-dragging { cursor: grabbing !important; user-select: none; }
+#etoro-atr-plugin.atr-minimized {
+    width: 175px;
+    padding: 6px 8px;
+    border-radius: 7px;
+}
+#etoro-atr-plugin.atr-minimized .atr-header-row { min-height: 20px; padding: 0; border-bottom: 0; }
+#etoro-atr-plugin.atr-minimized .atr-header { font-size: 9px; letter-spacing: .02em; }
+#etoro-atr-plugin.atr-minimized .atr-brand img { width: 18px; height: 18px; }
+#etoro-atr-plugin.atr-minimized #atr-refresh-btn { display: none; }
 
 #etoro-atr-plugin * { box-sizing: border-box; }
 .atr-header-row {
@@ -24,6 +36,8 @@
     border-bottom: 1px solid #363a45;
     cursor: move;
 }
+.atr-brand { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.atr-brand img { width: 20px; height: 20px; border-radius: 5px; }
 .atr-header { color: #a6a9b3; font-size: 11px; font-weight: 700; letter-spacing: .05em; }
 #atr-min-btn {
     padding: 0 5px;
@@ -34,7 +48,7 @@
 }
 #atr-min-btn:hover { color: #fff; }
 
-.plugin-grid { display: grid; grid-template-columns: 220px 1fr 1fr; gap: 10px; padding-top: 8px; }
+.plugin-grid { display: grid; grid-template-columns: 220px repeat(3, minmax(0, 1fr)); gap: 10px; padding-top: 8px; }
 .plugin-column { min-width: 0; }
 .analysis-column { padding-left: 10px; border-left: 1px solid #363a45; }
 .summary-line, .analysis-head, .time-legend, #trend-summary-legend {
@@ -152,6 +166,20 @@
 .plan-alert { padding: 3px 4px; border-radius: 3px; font-size: 8px; line-height: 1.3; }
 .plan-alert.ok { color: #8ff0bc; background: rgba(0, 170, 95, .12); }
 .plan-alert.bad, .plan-warning { color: #ffad9f; background: rgba(210, 65, 52, .12); }
+.fourier-cycle-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 6px; margin: 3px 0; }
+.fourier-cycle-row b { color: #b8c1cf; font-family: monospace; font-size: 8px; }
+.fourier-cycle-row strong { grid-column: 1 / -1; font-size: 8px; text-align: right; }
+.cycle-up { color: #55e8a2; }
+.cycle-down { color: #ff7d7d; }
+.cycle-turning { color: #ffd166; }
+.forecast-output { margin: 3px 0 6px; color: #aab3c0; font-size: 8px; line-height: 1.35; }
+.forecast-output small { display: block; margin-top: 2px; color: #737e8d; }
+.simulation-panel { margin: 6px 0; padding: 5px; border: 1px solid #384353; border-radius: 5px; background: rgba(26, 34, 45, .7); }
+.simulation-panel button { width: 100%; font-size: 8px; }
+#trend-simulation-output { margin-top: 4px; color: #8b95a4; font-size: 7px; line-height: 1.35; }
+#trend-simulation-output > div { display: grid; grid-template-columns: 1.2fr repeat(4, 1fr); gap: 3px; margin-top: 2px; }
+#trend-simulation-output b { color: #dce4ef; }
+#trend-simulation-output small { display: block; margin-top: 4px; color: #6f7885; }
 .trade-plan-note { margin-top: 5px; color: #737d8b; font-size: 7px; line-height: 1.3; }
 #trend-summary-legend {
     align-items: stretch;
@@ -162,9 +190,12 @@
 #trend-summary-legend > span { display: grid; gap: 2px; color: #818795; font-size: 8px; }
 #trend-summary-legend b { color: #fff; font-size: 9px; }
 .levels-panel { display: grid; gap: 4px; margin-top: 7px; padding-top: 6px; border-top: 1px solid #363a45; }
-.levels-panel > span, .levels-panel > div:not(.levels-title) { display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; color: #818795; font-size: 8px; }
+.levels-panel > span, .levels-panel > div:not(.levels-title):not(.wavelet-zone-columns) { display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; color: #818795; font-size: 8px; }
 .levels-title { color: #d8cbf3; font-size: 9px; font-weight: 700; }
 .levels-panel b { color: #d4b5ff; text-align: right; }
+.wavelet-zone-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.wavelet-zone-columns label { min-width: 0; color: #9ca5b4; font-size: 8px; }
+.wavelet-zone-columns select { width: 100%; margin-top: 3px; padding: 3px; border: 1px solid #454b58; border-radius: 3px; color: #e0d5f2; background: #20242e; font-family: monospace; font-size: 7px; }
 #calibration-status { margin-top: 7px; color: #8690a0; font-size: 8px; line-height: 1.35; }
 .model-info-panel { margin-top: 8px; padding: 7px; border: 1px solid #46405b; border-radius: 6px; background: rgba(37, 29, 54, .55); }
 .model-info-title { margin-bottom: 5px; color: #e8ddff; font-size: 10px; font-weight: 700; }
@@ -176,8 +207,8 @@
 .split-grid b { color: #fff; }
 #calibration-updated { margin-top: 3px; color: #777181; font-size: 7.5px; }
 
-@media (max-width: 650px) {
-    #etoro-atr-plugin { width: min(94vw, 790px); }
+@media (max-width: 900px) {
+    #etoro-atr-plugin:not(.atr-minimized) { width: min(94vw, 790px); }
     .plugin-grid { grid-template-columns: 1fr; }
     .analysis-column { padding: 8px 0 0; border-left: 0; border-top: 1px solid #363a45; }
 }

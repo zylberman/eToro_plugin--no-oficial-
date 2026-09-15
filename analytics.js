@@ -123,7 +123,7 @@
             : resistance.high + atr * stopBufferAtr;
         const structuralStopDistance = side === 'long' ? entryPrice - structuralStop : structuralStop - entryPrice;
         const recommendedAtrDistance = atr * recommendedAtrMultiple;
-        const stopDistance = Math.max(structuralStopDistance, recommendedAtrDistance);
+        const stopDistance = Math.max(structuralStopDistance, recommendedAtrDistance * 1.01);
         const technicalStop = side === 'long' ? entryPrice - stopDistance : entryPrice + stopDistance;
         const roundTripCost = exposure * openFeeRate * 2;
         const costDistance = Math.max(minimumProfit, roundTripCost) / units;
@@ -148,7 +148,7 @@
             stopPercent: stopDistance / entryPrice * 100,
             potentialProfit, potentialLoss, rewardRisk, openingCost, minimumProfit,
             targetFartherThanStop: targetDistance > stopDistance,
-            stopExceedsAtr: stopDistance > atr,
+            stopExceedsAtr: stopDistance > recommendedAtrDistance,
             targetCoversTwiceOpening: potentialProfit > minimumProfit,
             technicalRoomIsEnough: technicalTargetDistance >= targetDistance
         };
@@ -217,6 +217,93 @@
             };
         });
         return { ok: true, side, entryPrice, targets, stops, costTarget, openingCost, minimumProfit };
+    }
+
+    function calculateBestZoneTradePlan(options) {
+        const side = options?.side === 'short' ? 'short' : 'long';
+        const entryPrice = finiteNumber(options?.entryPrice, NaN);
+        const investment = finiteNumber(options?.investment, NaN);
+        const leverage = finiteNumber(options?.leverage, NaN);
+        const atr = finiteNumber(options?.atr, NaN);
+        const recommendedAtrMultiple = Math.max(1.01, finiteNumber(options?.recommendedAtrMultiple, 1.50));
+        const minimumZoneDistance = atr * recommendedAtrMultiple;
+        const supports = Array.isArray(options?.supports) ? options.supports
+            .filter(zone => entryPrice - finiteNumber(zone?.high, entryPrice) > minimumZoneDistance)
+            .sort((a, b) => b.high - a.high)
+            .slice(0, 4) : [];
+        const resistances = Array.isArray(options?.resistances) ? options.resistances
+            .filter(zone => finiteNumber(zone?.low, entryPrice) - entryPrice > minimumZoneDistance)
+            .sort((a, b) => a.low - b.low)
+            .slice(0, 4) : [];
+        const units = investment * leverage / entryPrice;
+        const openFeeRate = Math.max(0, finiteNumber(options?.openFeePercent)) / 100;
+        const minimumProfit = investment * leverage * openFeeRate
+            * Math.max(1.01, finiteNumber(options?.openingCostMultiple, 2));
+        const makeFallback = reason => {
+            const stopZone = side === 'long' ? supports[0] : resistances[0];
+            const structuralStop = stopZone
+                ? (side === 'long'
+                    ? stopZone.low - atr * finiteNumber(options?.stopBufferAtr, 0.10)
+                    : stopZone.high + atr * finiteNumber(options?.stopBufferAtr, 0.10))
+                : (side === 'long' ? entryPrice - minimumZoneDistance * 1.01 : entryPrice + minimumZoneDistance * 1.01);
+            const stopDistance = Math.max(Math.abs(entryPrice - structuralStop), minimumZoneDistance * 1.01);
+            const targetDistance = Math.max(stopDistance * 1.50, minimumProfit / units * 1.01);
+            return {
+                ok: true, fallback: true, reason, supports, resistances,
+                minimumZoneDistance, recommendedAtrMultiple, validCount: 0, totalCount: 0,
+                best: {
+                    side, entryPrice, technicalStop: side === 'long' ? entryPrice - stopDistance : entryPrice + stopDistance,
+                    technicalTarget: side === 'long' ? entryPrice + targetDistance : entryPrice - targetDistance,
+                    stopDistance, targetDistance,
+                    stopPercent: stopDistance / entryPrice * 100,
+                    targetPercent: targetDistance / entryPrice * 100,
+                    potentialLoss: units * stopDistance,
+                    potentialProfit: units * targetDistance,
+                    minimumProfit, recommendedAtrMultiple,
+                    rewardRisk: targetDistance / stopDistance,
+                    targetIndex: null, stopIndex: stopZone ? 1 : null,
+                    targetStrength: 0, stopStrength: finiteNumber(stopZone?.strength),
+                    fallback: true
+                }
+            };
+        };
+        if (!supports.length || !resistances.length) {
+            return makeFallback(`Falta ${!supports.length && !resistances.length ? 'soporte y resistencia' : !supports.length ? 'soporte' : 'resistencia'} fuera de ${recommendedAtrMultiple.toFixed(2)} ATR.`);
+        }
+        const combinations = [];
+        supports.forEach((support, supportIndex) => resistances.forEach((resistance, resistanceIndex) => {
+            const plan = calculateTradePlan({ ...options, side, support, resistance });
+            if (!plan.ok) return;
+            const targetDistance = plan.technicalTargetDistance;
+            const potentialProfit = units * targetDistance;
+            const rewardRisk = targetDistance / plan.stopDistance;
+            const valid = targetDistance > plan.stopDistance
+                && potentialProfit > plan.minimumProfit
+                && plan.stopDistance > minimumZoneDistance;
+            const targetStrength = side === 'long' ? resistance.strength : support.strength;
+            const stopStrength = side === 'long' ? support.strength : resistance.strength;
+            const score = Math.min(rewardRisk, 4) / 4 * 0.70
+                + (finiteNumber(targetStrength) + finiteNumber(stopStrength)) / 2 * 0.30;
+            combinations.push({
+                ...plan, valid, score, rewardRisk, targetDistance, potentialProfit,
+                targetPercent: targetDistance / entryPrice * 100,
+                targetIndex: side === 'long' ? resistanceIndex + 1 : supportIndex + 1,
+                stopIndex: side === 'long' ? supportIndex + 1 : resistanceIndex + 1,
+                targetStrength, stopStrength
+            });
+        }));
+        const valid = combinations.filter(item => item.valid).sort((a, b) => b.score - a.score);
+        if (!valid.length) {
+            const fallback = makeFallback(`Ninguna de las ${combinations.length} combinaciones cumple las tres reglas.`);
+            fallback.totalCount = combinations.length;
+            fallback.combinations = combinations;
+            return fallback;
+        }
+        return {
+            ok: true, best: valid[0], validCount: valid.length,
+            totalCount: combinations.length, combinations, supports, resistances,
+            minimumZoneDistance, recommendedAtrMultiple
+        };
     }
 
     function regression(values) {
@@ -359,6 +446,152 @@
             spectrum.push({ k, real, imag, magnitude: Math.hypot(real, imag) });
         }
         return spectrum.sort((a, b) => b.magnitude - a.magnitude);
+    }
+
+    function fourierComponentDirection(component, sampleSize, index = sampleSize - 1) {
+        const n = Math.max(2, Math.floor(finiteNumber(sampleSize, 0)));
+        const k = Math.max(1, Math.floor(finiteNumber(component?.k, 1)));
+        const real = finiteNumber(component?.real);
+        const imag = finiteNumber(component?.imag);
+        const valueAt = position => {
+            const angle = (2 * Math.PI * k * position) / n;
+            return (2 / n) * (real * Math.cos(angle) - imag * Math.sin(angle));
+        };
+        const current = valueAt(index);
+        const next = valueAt(index + 1);
+        const delta = next - current;
+        const amplitude = (2 / n) * Math.hypot(real, imag);
+        const threshold = Math.max(amplitude * 0.02, EPSILON);
+        const direction = Math.abs(delta) <= threshold ? 'turning' : delta > 0 ? 'up' : 'down';
+        return { direction, current, next, delta, amplitude };
+    }
+
+    function compareTrendMethods(prices, options = {}) {
+        const values = prices.map(Number).filter(value => Number.isFinite(value) && value > 0);
+        const lookback = Math.max(32, Math.floor(finiteNumber(options.lookback, 128)));
+        const trendWindow = Math.max(4, Math.floor(finiteNumber(options.trendWindow, 16)));
+        const harmonics = Math.max(1, Math.min(8, Math.floor(finiteNumber(options.harmonics, 5))));
+        const feeRate = Math.max(0, finiteNumber(options.feePercent, 0.03)) / 100;
+        const barsPerYear = Math.max(1, finiteNumber(options.barsPerYear, 24 * 252));
+        if (values.length < lookback + 2) return { ok: false, error: `Se requieren al menos ${lookback + 2} cierres.` };
+
+        const logSignal = window => {
+            const slope = regression(window.slice(-trendWindow).map(Math.log)).slope;
+            return window.at(-1) * (Math.exp(slope) - 1);
+        };
+        const fourierSignal = window => {
+            const logs = window.map(Math.log);
+            const line = regression(logs);
+            const residuals = logs.map((value, index) => value - line.intercept - line.slope * index);
+            return spectrumOf(residuals).slice(0, harmonics)
+                .reduce((sum, component) => sum + fourierComponentDirection(component, window.length).delta, 0)
+                * window.at(-1);
+        };
+        const run = signalFunction => {
+            let position = 0;
+            let equity = 1;
+            let peak = 1;
+            let maxDrawdown = 0;
+            let hits = 0;
+            let active = 0;
+            let changes = 0;
+            const returns = [];
+            for (let index = lookback - 1; index < values.length - 1; index++) {
+                const window = values.slice(index - lookback + 1, index + 1);
+                const recent = window.slice(-15);
+                const atrProxy = recent.slice(1).reduce((sum, value, i) => sum + Math.abs(value - recent[i]), 0) / Math.max(1, recent.length - 1);
+                const rawSignal = signalFunction(window);
+                const nextPosition = Math.abs(rawSignal) < atrProxy * 0.01 ? 0 : Math.sign(rawSignal);
+                let cost = 0;
+                if (nextPosition !== position) {
+                    if (position) cost += feeRate;
+                    if (nextPosition) cost += feeRate;
+                    changes++;
+                }
+                const marketReturn = values[index + 1] / values[index] - 1;
+                const strategyReturn = nextPosition * marketReturn - cost;
+                if (nextPosition) {
+                    active++;
+                    if (Math.sign(marketReturn) === nextPosition) hits++;
+                }
+                equity *= 1 + strategyReturn;
+                peak = Math.max(peak, equity);
+                maxDrawdown = Math.max(maxDrawdown, 1 - equity / peak);
+                returns.push(strategyReturn);
+                position = nextPosition;
+            }
+            if (position) equity *= 1 - feeRate;
+            const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+            const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, returns.length - 1);
+            const deviation = Math.sqrt(variance);
+            return {
+                observations: returns.length, active, changes,
+                accuracy: active ? hits / active : 0,
+                return: equity - 1,
+                maxDrawdown,
+                sharpe: deviation ? mean / deviation * Math.sqrt(barsPerYear) : 0
+            };
+        };
+        return { ok: true, logPrice: run(logSignal), fourier5: run(fourierSignal), lookback, trendWindow, harmonics, feePercent: feeRate * 100 };
+    }
+
+    function projectFourierToTargets(prices, atr, options = {}) {
+        const values = prices.map(Number).filter(value => Number.isFinite(value) && value > 0);
+        if (values.length < 32 || !(finiteNumber(atr, 0) > 0)) {
+            return { ok: false, error: 'Se requieren al menos 32 cierres y un ATR válido.' };
+        }
+        const n = values.length;
+        const horizonBars = Math.max(1, Math.min(720, Math.floor(finiteNumber(options.horizonBars, 24))));
+        const harmonics = Math.max(1, Math.min(15, Math.floor(finiteNumber(options.harmonics, 5))));
+        const logs = values.map(Math.log);
+        const line = regression(logs);
+        const residuals = logs.map((value, index) => value - line.intercept - line.slope * index);
+        const selected = spectrumOf(residuals).slice(0, harmonics);
+        const rawAt = index => {
+            let value = line.intercept + line.slope * index;
+            for (const component of selected) {
+                const angle = 2 * Math.PI * component.k * index / n;
+                value += 2 / n * (component.real * Math.cos(angle) - component.imag * Math.sin(angle));
+            }
+            return value;
+        };
+        const anchorOffset = logs.at(-1) - rawAt(n - 1);
+        const forecast = Array.from({ length: horizonBars + 1 }, (_, step) => Math.exp(rawAt(n - 1 + step) + anchorOffset));
+        const current = values.at(-1);
+        const longTarget = finiteNumber(options.longTarget, Infinity);
+        const shortTarget = finiteNumber(options.shortTarget, -Infinity);
+        let upAtrBar = null;
+        let downAtrBar = null;
+        let longTargetBar = null;
+        let shortTargetBar = null;
+        for (let step = 1; step < forecast.length; step++) {
+            if (upAtrBar === null && forecast[step] - current >= atr) upAtrBar = step;
+            if (downAtrBar === null && current - forecast[step] >= atr) downAtrBar = step;
+            if (longTargetBar === null && forecast[step] >= longTarget) longTargetBar = step;
+            if (shortTargetBar === null && forecast[step] <= shortTarget) shortTargetBar = step;
+        }
+        const candidates = [];
+        if (upAtrBar !== null && longTargetBar !== null) candidates.push({ direction: 'up', atrBar: upAtrBar, targetBar: longTargetBar, target: longTarget });
+        if (downAtrBar !== null && shortTargetBar !== null) candidates.push({ direction: 'down', atrBar: downAtrBar, targetBar: shortTargetBar, target: shortTarget });
+        candidates.sort((a, b) => a.targetBar - b.targetBar);
+        const winner = candidates[0] || null;
+        const ambiguous = candidates.length > 1;
+        const cycleDirections = selected.map(component => ({
+            k: component.k,
+            period: n / component.k,
+            ...fourierComponentDirection(component, n)
+        }));
+        const directionSign = winner?.direction === 'up' ? 1 : winner?.direction === 'down' ? -1 : 0;
+        const agreeing = directionSign
+            ? cycleDirections.filter(component => Math.sign(component.delta) === directionSign).length
+            : 0;
+        return {
+            ok: true, forecast, horizonBars, harmonics,
+            current, min: Math.min(...forecast), max: Math.max(...forecast),
+            upAtrBar, downAtrBar, longTargetBar, shortTargetBar,
+            winner, ambiguous, candidates, cycleDirections,
+            alignment: directionSign ? agreeing / cycleDirections.length : 0
+        };
     }
 
     /**
@@ -613,7 +846,8 @@
     }
 
     return {
-        calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateMultiLevelTradePlan, estimateTrendBreak,
+        calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateMultiLevelTradePlan, calculateBestZoneTradePlan,
+        fourierComponentDirection, compareTrendMethods, projectFourierToTargets, estimateTrendBreak,
         haarTransitionScore, haarScalogram, haarDecompose, haarReconstruct,
         haarWaveletAnalysis, findWaveletZones, analyzeCombined,
         calibrateCombinedModel, DEFAULT_MODEL_PARAMS, regression

@@ -14,10 +14,18 @@ El plugin sincroniza automáticamente el historial de velas desde **Yahoo Financ
 * **Sincronización Multi-Activo:** Mapeo automático de símbolos (GOLD, SILVER, BTC, ETH, etc.).
 * **Detección de Temporalidad:** Ajusta el cálculo automáticamente al cambiar entre 1m, 5m, 1h o 1d en la interfaz de eToro.
 * **Interfaz Ergonómica:** Panel flotante minimalista con función de minimizar para no obstruir el gráfico.
-* **Diseño en tres columnas:** Separa datos del activo y TP, análisis Fourier y reconstrucción Wavelet.
-* **Soportes, resistencias y ATR:** La primera columna muestra hasta tres zonas Wavelet por lado, su distancia, fuerza, ATR actual y un SL recomendado de 1,50 ATR expresado también en dólares.
-* **Plan TP/SL mínimo:** Bajo Fourier calcula un TP y SL que cumplen simultáneamente: distancia TP mayor que SL, beneficio del TP mayor que dos veces el coste de apertura y SL mayor que 1,50 ATR. Los muestra en precio, porcentaje y dólares, y avisa si la zona Wavelet deja espacio suficiente.
+* **Panel desplazable:** Puede arrastrarse desde el encabezado, cualquiera de sus bordes o áreas vacías; la posición queda guardada localmente.
+* **Diseño en cuatro columnas:** Separa datos del activo, análisis Fourier, proyección/plan operativo y reconstrucción Wavelet.
+* **Minimización compacta:** Al minimizar, el panel se convierte en una barra pequeña que conserva únicamente el título, estado de conexión y control de restauración.
+* **Actualización integral:** El botón de actualización vuelve a descargar el historial, leer precios ejecutables, recalcular ATR, Fourier, proyección, Wavelet, TP/SL, simulación y constantes calibradas.
+* **Identidad visual:** Incluye un icono propio para el panel y para la extensión en tamaños 16, 32, 48 y 128 px.
+* **Soportes, resistencias y ATR:** La primera columna agrupa en dos listas desplegables los primeros cuatro soportes y resistencias cuya distancia supera 1,50 ATR, junto con distancia y fuerza.
+* **Respaldo sin zona:** Si falta un soporte o resistencia utilizable, calcula un SL por ATR/estructura disponible y sitúa el TP al menos a 1,50 veces la distancia del SL, sin dejar de cubrir los costes mínimos.
+* **Plan TP/SL óptimo:** Bajo Fourier evalúa las 16 combinaciones entre las cuatro zonas de objetivo y las cuatro de stop. Descarta las que no cumplen TP > SL, beneficio mayor que dos veces el coste de apertura y SL > 1,50 ATR; entre las restantes prioriza R/R (70%) y fuerza Wavelet conjunta (30%).
 * **Fourier logarítmico:** El espectro y la reconstrucción usan log-precios para estudiar oscilaciones relativas (porcentuales) sin depender de la escala nominal del activo.
+* **Dirección por ciclo:** Cada armónico Fourier indica si su fase apunta hacia arriba, hacia abajo o está cerca de un giro/lateralidad en la siguiente vela.
+* **Proyección operativa a 12 horas:** Extiende la tendencia logarítmica y los ciclos activos, dibuja la trayectoria futura y señala si supera 1 ATR y alcanza primero el TP de compra o venta dentro del horizonte.
+* **Simulación comparativa:** Ejecuta un walk-forward causal sobre las velas cargadas para comparar la pendiente logarítmica de 16 velas con la dirección conjunta de los cinco armónicos Fourier dominantes, incluyendo costes por cambio de posición.
 * **Calibración walk-forward:** Ajusta pesos de Fourier, Wavelet, alineación y umbral en pasos de 0,01 usando exclusivamente información anterior a cada resultado histórico.
 * **Persistencia de Datos:** Guarda tus configuraciones locales mediante `localStorage`.
 * **Ruptura exploratoria:** Extrapola armónicos Fourier conservando fase y muestra si un detalle Haar multiescala confirma una transición reciente.
