@@ -1,6 +1,6 @@
 /**
- * Service Worker: realiza fetch a Yahoo Finance sin restricciones CORS.
- * El content script solicita datos vía mensaje; aquí hacemos la petición real.
+ * Service worker: fetches Yahoo Finance without page-level CORS restrictions.
+ * The content script requests data through messaging; the actual request is made here.
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action !== 'fetchYahooChart') return false;
@@ -18,5 +18,5 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
   })();
 
-  return true; // Mantener canal abierto para respuesta async
+  return true; // Keep the channel open for the asynchronous response.
 });

@@ -29,7 +29,7 @@
             + Math.max(0, finiteNumber(options?.safetyBuffer));
 
         if (!(entryPrice > 0) || !(investment > 0) || !(leverage > 0)) {
-            return { ok: false, error: 'Precio, inversión y apalancamiento deben ser mayores que cero.' };
+            return { ok: false, error: 'Price, investment and leverage must be greater than zero.' };
         }
 
         const exposure = investment * leverage;
@@ -39,12 +39,12 @@
 
         if (side === 'long') {
             const denominator = units * (1 - closeRate);
-            if (denominator <= EPSILON) return { ok: false, error: 'La comisión de cierre debe ser menor al 100%.' };
+            if (denominator <= EPSILON) return { ok: false, error: 'The closing fee must be below 100%.' };
             targetPrice = (units * entryPrice + openingVariableCost + fixedCosts) / denominator;
         } else {
             const denominator = units * (1 + closeRate);
             targetPrice = (units * entryPrice - openingVariableCost - fixedCosts) / denominator;
-            if (targetPrice <= 0) return { ok: false, error: 'Los costes superan el valor posible de la posición corta.' };
+            if (targetPrice <= 0) return { ok: false, error: 'Costs exceed the possible value of the short position.' };
         }
 
         const distance = Math.abs(targetPrice - entryPrice);
@@ -80,20 +80,20 @@
         const normalized = String(symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
         if (CFD_FEE_BY_SYMBOL[normalized] !== undefined) {
             const rate = CFD_FEE_BY_SYMBOL[normalized];
-            return { known: true, openFeePercent: rate, closeFeePercent: rate, label: `CFD ${rate}% por lado` };
+            return { known: true, openFeePercent: rate, closeFeePercent: rate, label: `CFD ${rate}% per side` };
         }
         if (CRYPTO_SYMBOLS.has(normalized)) {
-            return { known: true, openFeePercent: 1, closeFeePercent: 1, label: 'Cripto/CFD base: 1% por lado (sin descuento Club)' };
+            return { known: true, openFeePercent: 1, closeFeePercent: 1, label: 'Crypto/CFD base rate: 1% per side (before Club discount)' };
         }
         if (/^[A-Z]{6}$/.test(normalized)) {
-            return { known: true, openFeePercent: 0.005, closeFeePercent: 0.005, label: 'Divisa CFD: 0,005% por lado' };
+            return { known: true, openFeePercent: 0.005, closeFeePercent: 0.005, label: 'Currency CFD: 0.005% per side' };
         }
         if (finiteNumber(leverage, 1) > 1) {
-            return { known: true, openFeePercent: 0.15, closeFeePercent: 0.15, label: 'Acción/ETF CFD estimado: 0,15% por lado' };
+            return { known: true, openFeePercent: 0.15, closeFeePercent: 0.15, label: 'Estimated stock/ETF CFD: 0.15% per side' };
         }
         return {
             known: false, openFeePercent: 0, closeFeePercent: 0,
-            label: 'Tarifa no identificada: comprueba el coste estimado de eToro'
+            label: 'Unknown fee profile: verify the estimated cost in eToro'
         };
     }
 
@@ -110,9 +110,9 @@
         const recommendedAtrMultiple = Math.max(1.01, finiteNumber(options?.recommendedAtrMultiple, 1.50));
         const openingCostMultiple = Math.max(1.01, finiteNumber(options?.openingCostMultiple, 2));
         if (!(entryPrice > 0) || !(investment > 0) || !(leverage > 0) || !(atr > 0)) {
-            return { ok: false, error: 'Faltan precio, importe, apalancamiento o ATR.' };
+            return { ok: false, error: 'Price, investment, leverage or ATR is missing.' };
         }
-        if (!support || !resistance) return { ok: false, error: 'No hay soporte y resistencia Wavelet suficientes.' };
+        if (!support || !resistance) return { ok: false, error: 'There are not enough Wavelet support and resistance zones.' };
         const exposure = investment * leverage;
         const units = exposure / entryPrice;
         const openingCost = exposure * openFeeRate;
@@ -131,7 +131,7 @@
         const minimumTarget = side === 'long' ? entryPrice + targetDistance : entryPrice - targetDistance;
         const technicalTargetDistance = side === 'long' ? technicalTarget - entryPrice : entryPrice - technicalTarget;
         if (!(technicalTargetDistance > 0) || !(structuralStopDistance > 0)) {
-            return { ok: false, error: 'El precio está fuera de las zonas técnicas utilizables.' };
+            return { ok: false, error: 'The price is outside the usable technical zones.' };
         }
         const costTarget = side === 'long'
             ? entryPrice + costDistance
@@ -154,6 +154,160 @@
         };
     }
 
+    function calculateTicketRiskLevels(options) {
+        const side = options?.side === 'short' ? 'short' : 'long';
+        const entryPrice = finiteNumber(options?.entryPrice, NaN);
+        const investment = finiteNumber(options?.investment, NaN);
+        const leverage = finiteNumber(options?.leverage, NaN);
+        const atr = finiteNumber(options?.atr, NaN);
+        const atrMultiple = Math.max(1, finiteNumber(options?.atrMultiple, 1.50));
+        const targetPrice = finiteNumber(options?.targetPrice, NaN);
+        const stopPrice = finiteNumber(options?.stopPrice, NaN);
+        if (!(entryPrice > 0) || !(investment > 0) || !(leverage > 0) || !(atr > 0)) {
+            return { ok: false, error: 'Price, investment, leverage or ATR is missing.' };
+        }
+        const units = investment * leverage / entryPrice;
+        const priceForDistance = (distance, direction) => direction === 'up'
+            ? entryPrice + distance
+            : entryPrice - distance;
+        const atrMoney = units * atr;
+        const recommendedDistance = atr * atrMultiple;
+        const recommendedMoney = units * recommendedDistance;
+        const stopDistance = Number.isFinite(stopPrice) ? Math.abs(stopPrice - entryPrice) : NaN;
+        const targetDistance = Number.isFinite(targetPrice) ? Math.abs(targetPrice - entryPrice) : NaN;
+        return {
+            ok: true, side, units, atrMoney, atrMultiple,
+            recommendedDistance, recommendedMoney,
+            atrBoundaryPrice: priceForDistance(recommendedDistance, side === 'long' ? 'down' : 'up'),
+            targetAmount: Number.isFinite(targetDistance) ? units * targetDistance : NaN,
+            stopAmount: Number.isFinite(stopDistance) ? units * stopDistance : NaN,
+            targetDistance, stopDistance,
+            stopOutsideAtr: Number.isFinite(stopDistance) && stopDistance > recommendedDistance
+        };
+    }
+
+    function calculateOpportunityRisk(options = {}) {
+        const investment = Math.max(EPSILON, finiteNumber(options.investment, 0));
+        const potentialLoss = Math.max(0, finiteNumber(options.potentialLoss, 0));
+        const potentialProfit = Math.max(0, finiteNumber(options.potentialProfit, 0));
+        const feeKnown = options.feeKnown === true;
+        const roundTripCost = feeKnown ? Math.max(0, finiteNumber(options.roundTripCost, 0)) : null;
+        const confirmations = Math.max(0, Math.min(6, finiteNumber(options.confirmations, 0)));
+        const atrPercentile = Math.max(0, Math.min(100, finiteNumber(options.atrPercentile, 100))) / 100;
+        if (!(potentialLoss > 0)) {
+            return { riskScore: 1, riskLevel: 'high', netProfit: null, opportunityScore: -5 };
+        }
+        const lossRatio = potentialLoss / investment;
+        const riskScore = Math.min(1,
+            lossRatio * 15
+            + atrPercentile * 0.30
+            + (options.fallback ? 0.12 : 0)
+            + ((6 - confirmations) / 6) * 0.18
+            + (feeKnown ? 0 : 0.10)
+        );
+        const riskLevel = riskScore <= 0.35 ? 'low' : riskScore <= 0.60 ? 'medium' : 'high';
+        const netProfit = roundTripCost === null ? null : potentialProfit - roundTripCost;
+        const rankingProfit = netProfit === null ? potentialProfit * 0.75 : netProfit;
+        const opportunityScore = Math.max(-5, rankingProfit / Math.max(0.01, potentialLoss + (roundTripCost || 0)))
+            * (0.5 + confirmations / 12) * (1 - riskScore * 0.65);
+        return { riskScore, riskLevel, netProfit, opportunityScore };
+    }
+
+    function analyzeMarketFilters(candles, options = {}) {
+        const period = Math.max(5, Math.floor(finiteNumber(options.period, 14)));
+        const historyWindow = Math.max(20, Math.floor(finiteNumber(options.historyWindow, 200)));
+        const rows = (Array.isArray(candles) ? candles : []).map(row => ({
+            h: finiteNumber(row?.h, NaN), l: finiteNumber(row?.l, NaN), c: finiteNumber(row?.c, NaN),
+            v: finiteNumber(row?.v, NaN)
+        })).filter(row => Number.isFinite(row.h) && Number.isFinite(row.l) && Number.isFinite(row.c));
+        if (rows.length < period * 2 + 1) return { ok: false, error: `At least ${period * 2 + 1} OHLC candles are required.` };
+        const tr = [], plusDm = [], minusDm = [];
+        for (let i = 1; i < rows.length; i++) {
+            const up = rows[i].h - rows[i - 1].h;
+            const down = rows[i - 1].l - rows[i].l;
+            tr.push(Math.max(rows[i].h - rows[i].l, Math.abs(rows[i].h - rows[i - 1].c), Math.abs(rows[i].l - rows[i - 1].c)));
+            plusDm.push(up > down && up > 0 ? up : 0);
+            minusDm.push(down > up && down > 0 ? down : 0);
+        }
+        const meanLast = (values, end, length) => values.slice(Math.max(0, end - length), end).reduce((a, b) => a + b, 0) / length;
+        const dx = [];
+        for (let end = period; end <= tr.length; end++) {
+            const atr = meanLast(tr, end, period);
+            const plus = atr > 0 ? 100 * meanLast(plusDm, end, period) / atr : 0;
+            const minus = atr > 0 ? 100 * meanLast(minusDm, end, period) / atr : 0;
+            dx.push(plus + minus > 0 ? 100 * Math.abs(plus - minus) / (plus + minus) : 0);
+        }
+        const adx = dx.slice(-period).reduce((a, b) => a + b, 0) / Math.min(period, dx.length);
+        const recent = rows.slice(-(period + 1)).map(row => row.c);
+        const path = recent.slice(1).reduce((sum, value, index) => sum + Math.abs(value - recent[index]), 0);
+        const efficiency = path > 0 ? Math.abs(recent.at(-1) - recent[0]) / path : 0;
+        const direction = Math.sign(recent.at(-1) - recent[0]);
+        const regime = adx >= 20 && efficiency >= 0.25 ? 'trend'
+            : adx < 18 && efficiency < 0.25 ? 'range' : 'transition';
+        const atrSeries = [];
+        for (let end = period; end <= tr.length; end++) atrSeries.push(meanLast(tr, end, period));
+        const atrHistory = atrSeries.slice(-historyWindow);
+        const currentAtr = atrHistory.at(-1);
+        const atrPercentile = atrHistory.filter(value => value <= currentAtr).length / atrHistory.length * 100;
+        const volumeRows = rows.slice(-21).filter(row => Number.isFinite(row.v) && row.v > 0);
+        const volumeAvailable = volumeRows.length >= 10;
+        let relativeVolume = NaN, vwap = NaN;
+        if (volumeAvailable) {
+            const currentVolume = volumeRows.at(-1).v;
+            const prior = volumeRows.slice(0, -1);
+            relativeVolume = currentVolume / (prior.reduce((sum, row) => sum + row.v, 0) / prior.length);
+            const volumeTotal = volumeRows.reduce((sum, row) => sum + row.v, 0);
+            vwap = volumeRows.reduce((sum, row) => sum + ((row.h + row.l + row.c) / 3) * row.v, 0) / volumeTotal;
+        }
+        return {
+            ok: true, adx, efficiency, direction, regime, currentAtr, atrPercentile,
+            volatility: atrPercentile >= 80 ? 'high' : atrPercentile <= 30 ? 'low' : 'normal',
+            volumeAvailable, relativeVolume, vwap, currentPrice: rows.at(-1).c,
+            volumeConfirmsLong: volumeAvailable && relativeVolume >= 1.10 && rows.at(-1).c >= vwap,
+            volumeConfirmsShort: volumeAvailable && relativeVolume >= 1.10 && rows.at(-1).c <= vwap
+        };
+    }
+
+    function evaluateEntryDecision(options = {}) {
+        const side = options.side === 'short' ? 'short' : 'long';
+        const projection = options.projection || {};
+        const plan = options.plan || {};
+        const best = plan.best || {};
+        const expectedDirection = side === 'long' ? 'up' : 'down';
+        const atr = Math.max(0, finiteNumber(options.atr));
+        const atrMultiple = Math.max(1, finiteNumber(options.atrMultiple, 1.5));
+        const minimumStopDistance = atr * atrMultiple;
+        const roundTripCost = Math.max(0, finiteNumber(options.roundTripCost));
+        const feeKnown = options.feeKnown !== false;
+        const hasWaveletTarget = Number.isFinite(best.targetIndex) && best.targetIndex > 0;
+        const hasWaveletStop = Number.isFinite(best.stopIndex) && best.stopIndex > 0;
+        const projectedToTarget = projection.ok === true
+            && projection.winner?.direction === expectedDirection
+            && Number.isFinite(projection.winner?.targetBar);
+        const costThreshold = roundTripCost * Math.max(1, finiteNumber(options.costMultiple, 2));
+        const checks = [
+            { key: 'plan', label: 'TP and SL calculated for this direction', pass: plan.ok === true },
+            { key: 'fourier', label: 'Fourier exceeds 1 ATR and reaches this TP within 10 candles', pass: projectedToTarget },
+            { key: 'wavelet', label: hasWaveletTarget && hasWaveletStop
+                ? 'TP and SL come from Wavelet zones'
+                : 'No complete Wavelet pair: ATR/RR fallback is used', pass: plan.ok === true },
+            { key: 'atr', label: `SL outside noise: distance ≥ ${atrMultiple.toFixed(2)} ATR`, pass: plan.ok === true && atr > 0 && finiteNumber(best.stopDistance) >= minimumStopDistance },
+            { key: 'riskReward', label: 'TP ≥ 1,5 × SL', pass: plan.ok === true && finiteNumber(best.rewardRisk) >= 1.5 },
+            { key: 'cost', label: feeKnown
+                ? 'Gross profit ≥ 2× estimated round-trip cost'
+                : 'Verifiable round-trip cost', pass: feeKnown && plan.ok === true && finiteNumber(best.potentialProfit) >= costThreshold }
+        ];
+        const allowed = checks.every(check => check.pass);
+        return {
+            side, allowed,
+            decision: allowed ? (side === 'long' ? 'LONG IS VIABLE' : 'SHORT IS VIABLE') : 'NOT VIABLE',
+            checks, projectedToTarget, hasWaveletTarget, hasWaveletStop,
+            minimumStopDistance, roundTripCost, costThreshold,
+            grossProfit: finiteNumber(best.potentialProfit),
+            netProfit: feeKnown ? finiteNumber(best.potentialProfit) - roundTripCost : null
+        };
+    }
+
     function calculateMultiLevelTradePlan(options) {
         const side = options?.side === 'short' ? 'short' : 'long';
         const entryPrice = finiteNumber(options?.entryPrice, NaN);
@@ -164,7 +318,7 @@
         const stopBufferAtr = Math.max(0, finiteNumber(options?.stopBufferAtr, 0.10));
         const maxLevels = Math.max(1, Math.min(8, Math.floor(finiteNumber(options?.maxLevels, 4))));
         if (!(entryPrice > 0) || !(investment > 0) || !(leverage > 0) || !(atr > 0)) {
-            return { ok: false, error: 'Faltan precio, importe, apalancamiento o ATR.' };
+            return { ok: false, error: 'Price, investment, leverage or ATR is missing.' };
         }
         const supports = Array.isArray(options?.supports) ? options.supports : [];
         const resistances = Array.isArray(options?.resistances) ? options.resistances : [];
@@ -182,7 +336,7 @@
             ? supports.filter(zone => zone.low < entryPrice).sort((a, b) => b.low - a.low)
             : resistances.filter(zone => zone.high > entryPrice).sort((a, b) => a.high - b.high)).slice(0, maxLevels);
         if (!targetZones.length || !stopZones.length) {
-            return { ok: false, error: 'No hay suficientes zonas Wavelet a ambos lados del precio.' };
+            return { ok: false, error: 'There are not enough Wavelet zones on both sides of the price.' };
         }
         const exposure = investment * leverage;
         const units = exposure / entryPrice;
@@ -237,8 +391,13 @@
             .slice(0, 4) : [];
         const units = investment * leverage / entryPrice;
         const openFeeRate = Math.max(0, finiteNumber(options?.openFeePercent)) / 100;
-        const minimumProfit = investment * leverage * openFeeRate
-            * Math.max(1.01, finiteNumber(options?.openingCostMultiple, 2));
+        const hasRoundTripCost = Number.isFinite(Number(options?.closeFeePercent));
+        const closeFeeRate = hasRoundTripCost ? Math.max(0, finiteNumber(options?.closeFeePercent)) / 100 : 0;
+        const feeRate = hasRoundTripCost ? openFeeRate + closeFeeRate : openFeeRate;
+        const costMultiple = hasRoundTripCost
+            ? Math.max(1.01, finiteNumber(options?.roundTripCostMultiple, 2))
+            : Math.max(1.01, finiteNumber(options?.openingCostMultiple, 2));
+        const minimumProfit = investment * leverage * feeRate * costMultiple;
         const makeFallback = reason => {
             const stopZone = side === 'long' ? supports[0] : resistances[0];
             const structuralStop = stopZone
@@ -268,7 +427,7 @@
             };
         };
         if (!supports.length || !resistances.length) {
-            return makeFallback(`Falta ${!supports.length && !resistances.length ? 'soporte y resistencia' : !supports.length ? 'soporte' : 'resistencia'} fuera de ${recommendedAtrMultiple.toFixed(2)} ATR.`);
+            return makeFallback(`Missing ${!supports.length && !resistances.length ? 'support and resistance' : !supports.length ? 'support' : 'resistance'} beyond ${recommendedAtrMultiple.toFixed(2)} ATR.`);
         }
         const combinations = [];
         supports.forEach((support, supportIndex) => resistances.forEach((resistance, resistanceIndex) => {
@@ -278,7 +437,7 @@
             const potentialProfit = units * targetDistance;
             const rewardRisk = targetDistance / plan.stopDistance;
             const valid = targetDistance > plan.stopDistance
-                && potentialProfit > plan.minimumProfit
+                && potentialProfit > minimumProfit
                 && plan.stopDistance > minimumZoneDistance;
             const targetStrength = side === 'long' ? resistance.strength : support.strength;
             const stopStrength = side === 'long' ? support.strength : resistance.strength;
@@ -287,6 +446,10 @@
             combinations.push({
                 ...plan, valid, score, rewardRisk, targetDistance, potentialProfit,
                 targetPercent: targetDistance / entryPrice * 100,
+                targetFartherThanStop: targetDistance > plan.stopDistance,
+                minimumProfit,
+                targetCoversTwiceOpening: potentialProfit > minimumProfit,
+                technicalRoomIsEnough: targetDistance >= plan.targetDistance,
                 targetIndex: side === 'long' ? resistanceIndex + 1 : supportIndex + 1,
                 stopIndex: side === 'long' ? supportIndex + 1 : resistanceIndex + 1,
                 targetStrength, stopStrength
@@ -294,7 +457,7 @@
         }));
         const valid = combinations.filter(item => item.valid).sort((a, b) => b.score - a.score);
         if (!valid.length) {
-            const fallback = makeFallback(`Ninguna de las ${combinations.length} combinaciones cumple las tres reglas.`);
+            const fallback = makeFallback(`None of the ${combinations.length} combinations satisfies all three rules.`);
             fallback.totalCount = combinations.length;
             fallback.combinations = combinations;
             return fallback;
@@ -373,10 +536,10 @@
     function haarDecompose(values) {
         const input = values.map(Number);
         if (!input.length || input.some(value => !Number.isFinite(value))) {
-            return { ok: false, error: 'La serie Wavelet contiene valores no válidos.' };
+            return { ok: false, error: 'The Wavelet series contains invalid values.' };
         }
         if ((input.length & (input.length - 1)) !== 0) {
-            return { ok: false, error: 'La transformada Haar requiere una muestra potencia de dos.' };
+            return { ok: false, error: 'The Haar transform requires a power-of-two sample size.' };
         }
         const details = [];
         let approximation = [...input];
@@ -473,7 +636,7 @@
         const harmonics = Math.max(1, Math.min(8, Math.floor(finiteNumber(options.harmonics, 5))));
         const feeRate = Math.max(0, finiteNumber(options.feePercent, 0.03)) / 100;
         const barsPerYear = Math.max(1, finiteNumber(options.barsPerYear, 24 * 252));
-        if (values.length < lookback + 2) return { ok: false, error: `Se requieren al menos ${lookback + 2} cierres.` };
+        if (values.length < lookback + 2) return { ok: false, error: `At least ${lookback + 2} closes are required.` };
 
         const logSignal = window => {
             const slope = regression(window.slice(-trendWindow).map(Math.log)).slope;
@@ -538,7 +701,7 @@
     function projectFourierToTargets(prices, atr, options = {}) {
         const values = prices.map(Number).filter(value => Number.isFinite(value) && value > 0);
         if (values.length < 32 || !(finiteNumber(atr, 0) > 0)) {
-            return { ok: false, error: 'Se requieren al menos 32 cierres y un ATR válido.' };
+            return { ok: false, error: 'At least 32 closes and a valid ATR are required.' };
         }
         const n = values.length;
         const horizonBars = Math.max(1, Math.min(720, Math.floor(finiteNumber(options.horizonBars, 24))));
@@ -557,6 +720,16 @@
         };
         const anchorOffset = logs.at(-1) - rawAt(n - 1);
         const forecast = Array.from({ length: horizonBars + 1 }, (_, step) => Math.exp(rawAt(n - 1 + step) + anchorOffset));
+        // Illustrative dispersion based on recent log-return volatility.
+        // It grows with sqrt(t), so distant points are necessarily less precise.
+        const logReturns = logs.slice(1).map((value, index) => value - logs[index]);
+        const recentReturns = logReturns.slice(-Math.min(64, logReturns.length));
+        const returnMean = recentReturns.reduce((sum, value) => sum + value, 0) / recentReturns.length;
+        const returnSigma = Math.sqrt(recentReturns.reduce((sum, value) => sum + (value - returnMean) ** 2, 0)
+            / Math.max(1, recentReturns.length - 1));
+        const dispersionZ = Math.max(0.1, finiteNumber(options.dispersionZ, 1));
+        const lowerBand = forecast.map((value, step) => value * Math.exp(-dispersionZ * returnSigma * Math.sqrt(step)));
+        const upperBand = forecast.map((value, step) => value * Math.exp(dispersionZ * returnSigma * Math.sqrt(step)));
         const current = values.at(-1);
         const longTarget = finiteNumber(options.longTarget, Infinity);
         const shortTarget = finiteNumber(options.shortTarget, -Infinity);
@@ -586,7 +759,7 @@
             ? cycleDirections.filter(component => Math.sign(component.delta) === directionSign).length
             : 0;
         return {
-            ok: true, forecast, horizonBars, harmonics,
+            ok: true, forecast, lowerBand, upperBand, returnSigma, dispersionZ, horizonBars, harmonics,
             current, min: Math.min(...forecast), max: Math.max(...forecast),
             upAtrBar, downAtrBar, longTargetBar, shortTargetBar,
             winner, ambiguous, candidates, cycleDirections,
@@ -602,7 +775,7 @@
      */
     function estimateTrendBreak(prices, atr, options = {}) {
         const values = prices.map(Number).filter(Number.isFinite);
-        if (values.length < 32) return { ok: false, error: 'Se requieren al menos 32 precios.' };
+        if (values.length < 32) return { ok: false, error: 'At least 32 prices are required.' };
         const n = values.length;
         const logValues = values.every(value => value > 0) ? values.map(Math.log) : values;
         const horizon = Math.max(4, Math.min(64, Math.floor(finiteNumber(options.horizon, 24))));
@@ -613,12 +786,17 @@
         const line = regression(logValues);
         const residuals = logValues.map((value, index) => value - (line.intercept + line.slope * index));
         const selected = spectrumOf(residuals).slice(0, harmonics);
-        const projectAt = index => {
+        const rawAt = index => {
             let projected = line.intercept + line.slope * index;
             for (const component of selected) {
                 const angle = (2 * Math.PI * component.k * index) / n;
                 projected += (2 / n) * (component.real * Math.cos(angle) - component.imag * Math.sin(angle));
             }
+            return projected;
+        };
+        const anchorOffset = logValues[n - 1] - rawAt(n - 1);
+        const projectAt = index => {
+            const projected = rawAt(index) + anchorOffset;
             return logValues === values ? projected : Math.exp(projected);
         };
         const forecast = [];
@@ -633,7 +811,7 @@
                 const projectedTrend = line.intercept + line.slope * (n - 1 + step);
                 const trendOnly = logValues === values ? projectedTrend : Math.exp(projectedTrend);
                 if (Math.sign(localSlope) === -direction && Math.abs(forecast[step] - trendOnly) >= minMove) {
-                    candidate = { bars: step, price: forecast[step], direction: direction > 0 ? 'bajista' : 'alcista' };
+                    candidate = { bars: step, price: forecast[step], direction: direction > 0 ? 'bearish' : 'bullish' };
                     break;
                 }
             }
@@ -721,7 +899,7 @@
         const zones = findWaveletZones(prices, atr, params);
         const candidate = fourier.candidate;
         const relevant = candidate
-            ? (candidate.direction === 'alcista' ? zones.supports : zones.resistances)
+            ? (candidate.direction === 'bullish' ? zones.supports : zones.resistances)
             : [];
         const nearestZone = candidate && relevant.length
             ? [...relevant].sort((a, b) => Math.abs(a.center - candidate.price) - Math.abs(b.center - candidate.price))[0]
@@ -773,7 +951,7 @@
         const generatedSamples = calibrationSamples(prices, options);
         const minimum = Math.max(10, Math.floor(finiteNumber(options.minimumSamples, 12)));
         if (generatedSamples.length < minimum) {
-            return { ok: false, error: `Historial insuficiente: ${generatedSamples.length}/${minimum} casos.`, params: { ...DEFAULT_MODEL_PARAMS }, samples: generatedSamples.length };
+            return { ok: false, error: `Insufficient history: ${generatedSamples.length}/${minimum} cases.`, params: { ...DEFAULT_MODEL_PARAMS }, samples: generatedSamples.length };
         }
         // Use a multiple of ten so the chronological partition is exactly 80/10/10.
         const usableCount = Math.floor(generatedSamples.length / 10) * 10;
@@ -782,7 +960,7 @@
         const testCount = samples.length / 10;
         const validationCount = samples.length - trainCount - testCount;
         if (validationCount < 1) {
-            return { ok: false, error: 'Se necesita historial suficiente para separar entrenamiento, test y validación.', params: { ...DEFAULT_MODEL_PARAMS }, samples: samples.length };
+            return { ok: false, error: 'Enough history is required to separate training, test and validation.', params: { ...DEFAULT_MODEL_PARAMS }, samples: samples.length };
         }
         const trainSamples = samples.slice(0, trainCount);
         const testSamples = samples.slice(trainCount, trainCount + testCount);
@@ -846,7 +1024,7 @@
     }
 
     return {
-        calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateMultiLevelTradePlan, calculateBestZoneTradePlan,
+        calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, calculateOpportunityRisk, analyzeMarketFilters, evaluateEntryDecision, calculateMultiLevelTradePlan, calculateBestZoneTradePlan,
         fourierComponentDirection, compareTrendMethods, projectFourierToTargets, estimateTrendBreak,
         haarTransitionScore, haarScalogram, haarDecompose, haarReconstruct,
         haarWaveletAnalysis, findWaveletZones, analyzeCombined,

@@ -1,13 +1,105 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateMultiLevelTradePlan,
+    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, calculateOpportunityRisk, analyzeMarketFilters, evaluateEntryDecision, calculateMultiLevelTradePlan,
     calculateBestZoneTradePlan, fourierComponentDirection, compareTrendMethods,
     projectFourierToTargets, estimateTrendBreak,
     haarTransitionScore, haarScalogram, haarDecompose,
     haarReconstruct, haarWaveletAnalysis, findWaveletZones,
     analyzeCombined, calibrateCombinedModel
 } = require('../analytics.js');
+
+test('opportunity ranking favors lower loss and higher net reward without requiring six confirmations', () => {
+    const safer = calculateOpportunityRisk({
+        investment: 70, potentialLoss: 1, potentialProfit: 2.5,
+        roundTripCost: 0.10, feeKnown: true, atrPercentile: 25,
+        confirmations: 4, fallback: false
+    });
+    const riskier = calculateOpportunityRisk({
+        investment: 70, potentialLoss: 4, potentialProfit: 3,
+        roundTripCost: 0.10, feeKnown: true, atrPercentile: 85,
+        confirmations: 6, fallback: false
+    });
+    assert.equal(safer.netProfit, 2.4);
+    assert.ok(safer.riskScore < riskier.riskScore);
+    assert.ok(safer.opportunityScore > riskier.opportunityScore);
+});
+
+test('ticket amounts convert ATR and price levels to eToro dollar fields', () => {
+    const result = calculateTicketRiskLevels({
+        side: 'long', entryPrice: 2000, investment: 20, leverage: 1,
+        atr: 40, atrMultiple: 1.5, targetPrice: 2120, stopPrice: 1930
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.units, 0.01);
+    assert.equal(result.atrMoney, 0.4);
+    assert.equal(result.recommendedMoney, 0.6);
+    assert.equal(result.atrBoundaryPrice, 1940);
+    assert.equal(result.targetAmount, 1.2);
+    assert.ok(Math.abs(result.stopAmount - 0.7) < 1e-12);
+    assert.equal(result.stopOutsideAtr, true);
+});
+
+test('short ticket puts the ATR stop boundary above entry', () => {
+    const result = calculateTicketRiskLevels({
+        side: 'short', entryPrice: 100, investment: 50, leverage: 2,
+        atr: 2, atrMultiple: 1.5, targetPrice: 95, stopPrice: 104
+    });
+    assert.equal(result.atrBoundaryPrice, 103);
+    assert.equal(result.targetAmount, 5);
+    assert.equal(result.stopAmount, 4);
+    assert.equal(result.stopOutsideAtr, true);
+});
+
+test('market filters identify a liquid directional regime and ATR percentile', () => {
+    const candles = Array.from({ length: 80 }, (_, i) => ({
+        h: 100 + i * 0.5 + 0.3, l: 100 + i * 0.5 - 0.2, c: 100 + i * 0.5,
+        v: i === 79 ? 2200 : 1000
+    }));
+    const result = analyzeMarketFilters(candles);
+    assert.equal(result.ok, true);
+    assert.equal(result.regime, 'trend');
+    assert.equal(result.direction, 1);
+    assert.equal(result.volumeAvailable, true);
+    assert.equal(result.volumeConfirmsLong, true);
+    assert.ok(result.atrPercentile >= 0 && result.atrPercentile <= 100);
+});
+
+test('entry gate ignores volume when Fourier, Wavelet/ATR, reward and costs are viable', () => {
+    const decision = evaluateEntryDecision({
+        side: 'long',
+        projection: { ok: true, winner: { direction: 'up', targetBar: 4 } },
+        filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: false },
+        atr: 1, roundTripCost: 0.5,
+        plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
+    });
+    assert.equal(decision.decision, 'LONG IS VIABLE');
+    assert.equal(decision.allowed, true);
+});
+
+test('entry gate allows a fully confirmed long setup', () => {
+    const decision = evaluateEntryDecision({
+        side: 'long',
+        projection: { ok: true, winner: { direction: 'up', targetBar: 3 } },
+        filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: true },
+        atr: 1, roundTripCost: 0.5,
+        plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
+    });
+    assert.equal(decision.decision, 'LONG IS VIABLE');
+    assert.ok(decision.checks.every(check => check.pass));
+});
+
+test('entry gate rejects an unknown fee instead of treating it as zero', () => {
+    const decision = evaluateEntryDecision({
+        side: 'long', feeKnown: false,
+        projection: { ok: true, winner: { direction: 'up', targetBar: 2 } },
+        filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: true },
+        atr: 1, roundTripCost: 0,
+        plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
+    });
+    assert.equal(decision.decision, 'NOT VIABLE');
+    assert.equal(decision.checks.find(check => check.key === 'cost').pass, false);
+});
 
 test('long TP covers percentage and fixed round-trip costs', () => {
     const result = calculateBreakEvenTP({
@@ -228,6 +320,14 @@ test('trend-break estimator returns a bounded exploratory forecast', () => {
     if (result.candidate) assert.ok(result.candidate.bars >= 2 && result.candidate.bars <= 23);
 });
 
+test('trend-break Fourier curve is anchored to the latest real price', () => {
+    const prices = Array.from({ length: 128 }, (_, i) => 100 + i * 0.02 + Math.sin(i / 6));
+    const result = estimateTrendBreak(prices, 0.7, { harmonics: 3, horizon: 10 });
+    assert.equal(result.ok, true);
+    assert.ok(Math.abs(result.forecast[0] - prices.at(-1)) < 1e-10);
+    assert.equal(result.forecast.length, 11);
+});
+
 test('Fourier component direction follows its phase into the next candle', () => {
     const falling = fourierComponentDirection({ k: 1, real: 64, imag: 0 }, 128, 32);
     const rising = fourierComponentDirection({ k: 1, real: 64, imag: 0 }, 128, 96);
@@ -259,4 +359,17 @@ test('Fourier future projection is anchored and bounded to the requested horizon
     assert.ok(Math.abs(result.forecast[0] - prices.at(-1)) < 1e-9);
     assert.equal(result.cycleDirections.length, 5);
     assert.ok(result.alignment >= 0 && result.alignment <= 1);
+});
+
+test('Fourier future dispersion widens with forecast distance', () => {
+    const prices = Array.from({ length: 128 }, (_, i) => 100 + i * 0.03 + Math.sin(i / 5));
+    const result = projectFourierToTargets(prices, 0.8, { harmonics: 5, horizonBars: 10 });
+    assert.equal(result.forecast.length, 11);
+    assert.equal(result.lowerBand.length, 11);
+    assert.equal(result.upperBand.length, 11);
+    const nearWidth = result.upperBand[1] - result.lowerBand[1];
+    const farWidth = result.upperBand[10] - result.lowerBand[10];
+    assert.ok(farWidth > nearWidth);
+    assert.equal(result.upperBand[0], result.forecast[0]);
+    assert.equal(result.lowerBand[0], result.forecast[0]);
 });
