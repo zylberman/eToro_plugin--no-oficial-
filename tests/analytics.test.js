@@ -1,13 +1,41 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, calculateOpportunityRisk, analyzeMarketFilters, evaluateEntryDecision, calculateMultiLevelTradePlan,
+    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, analyzeCostAdjustedExcursion, calculateOpportunityRisk, analyzeMarketFilters, evaluateEntryDecision, calculateMultiLevelTradePlan,
     calculateBestZoneTradePlan, fourierComponentDirection, compareTrendMethods,
-    projectFourierToTargets, estimateTrendBreak,
+    projectFourierToTargets, simulateFourierHoldout, simulateFourierAtrStrategy, estimateTrendBreak,
     haarTransitionScore, haarScalogram, haarDecompose,
     haarReconstruct, haarWaveletAnalysis, findWaveletZones,
-    analyzeCombined, calibrateCombinedModel
+    analyzeCombined, calibrateCombinedModel, aggregateCandlesToTimeframe
 } = require('../analytics.js');
+
+test('5-minute candles aggregate into complete 10-minute OHLC and reject irregular quotes', () => {
+    const candles = [
+        { t: 0, o: 100, h: 102, l: 99, c: 101, v: 10 },
+        { t: 300, o: 101, h: 104, l: 100, c: 103, v: 12 },
+        { t: 600, o: 103, h: 105, l: 102, c: 104, v: 8 },
+        { t: 725, o: 999, h: 999, l: 999, c: 999, v: 1 }
+    ];
+    const result = aggregateCandlesToTimeframe(candles, 5, 10, 1200);
+    assert.equal(result.length, 1);
+    assert.deepEqual({ o: result[0].o, h: result[0].h, l: result[0].l, c: result[0].c, v: result[0].v },
+        { o: 100, h: 104, l: 99, c: 103, v: 22 });
+});
+
+const viableExcursion = { ok: true, viable: true, hitRate: 0.65, minimumHitRate: 0.55 };
+
+test('cost-adjusted excursion requires enough historical favorable movement to net twice the opening cost', () => {
+    const prices = Array.from({ length: 90 }, (_, index) => 100 + index * 0.20);
+    const result = analyzeCostAdjustedExcursion(prices, {
+        side: 'long', horizonBars: 10, investment: 100, leverage: 1,
+        openingCost: 0.10, roundTripCost: 0.20, requiredNetMultiple: 2
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.requiredNetProfit, 0.20);
+    assert.equal(result.requiredGrossProfit, 0.40);
+    assert.equal(result.viable, true);
+    assert.ok(result.hitRate >= 0.55);
+});
 
 test('opportunity ranking favors lower loss and higher net reward without requiring six confirmations', () => {
     const safer = calculateOpportunityRisk({
@@ -71,6 +99,7 @@ test('entry gate ignores volume when Fourier, Wavelet/ATR, reward and costs are 
         projection: { ok: true, winner: { direction: 'up', targetBar: 4 } },
         filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: false },
         atr: 1, roundTripCost: 0.5,
+        openingCost: 0.25, costExcursion: viableExcursion,
         plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
     });
     assert.equal(decision.decision, 'LONG IS VIABLE');
@@ -83,6 +112,7 @@ test('entry gate allows a fully confirmed long setup', () => {
         projection: { ok: true, winner: { direction: 'up', targetBar: 3 } },
         filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: true },
         atr: 1, roundTripCost: 0.5,
+        openingCost: 0.25, costExcursion: viableExcursion,
         plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
     });
     assert.equal(decision.decision, 'LONG IS VIABLE');
@@ -95,6 +125,7 @@ test('entry gate rejects an unknown fee instead of treating it as zero', () => {
         projection: { ok: true, winner: { direction: 'up', targetBar: 2 } },
         filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: true },
         atr: 1, roundTripCost: 0,
+        openingCost: 0, costExcursion: viableExcursion,
         plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
     });
     assert.equal(decision.decision, 'NOT VIABLE');
@@ -299,6 +330,26 @@ test('combined analysis returns a bounded alignment score', () => {
     assert.ok(Array.isArray(result.zones.supports));
 });
 
+test('Wavelet zones use separated OHLC-confirmed contacts and classify outcomes', () => {
+    const candles = Array.from({ length: 128 }, (_, index) => {
+        const close = 100 + 1.8 * Math.sin(2 * Math.PI * index / 16);
+        return { o: close - 0.05, h: close + 0.25, l: close - 0.25, c: close, v: 100 };
+    });
+    const zones = findWaveletZones(candles.map(candle => candle.c), 0.5, {
+        candles, minContactSeparation: 5, confirmationBars: 4
+    });
+    assert.ok(['range', 'trending_up', 'trending_down', 'bullish_breakout', 'bearish_breakout'].includes(zones.regime));
+    for (const zone of [...zones.supports, ...zones.resistances]) {
+        assert.equal(zone.touches, zone.events.length);
+        assert.equal(zone.touches, zone.bounces + zone.breaks + zone.unconfirmed);
+        for (let index = 1; index < zone.events.length; index++) {
+            assert.ok(zone.events[index].index - zone.events[index - 1].index >= 5);
+        }
+    }
+    const plateaus = new Set(zones.pivots.map(pivot => `${pivot.type}:${pivot.plateauStart}:${pivot.plateauEnd}`));
+    assert.equal(plateaus.size, zones.pivots.length);
+});
+
 test('historical calibration changes constants only in 0.01 steps', () => {
     const prices = Array.from({ length: 520 }, (_, i) => 100 + Math.sin((2 * Math.PI * i) / 32) + 0.25 * Math.sin(i / 5));
     const result = calibrateCombinedModel(prices, { maxSamples: 18, minimumSamples: 10, horizon: 12 });
@@ -320,12 +371,14 @@ test('trend-break estimator returns a bounded exploratory forecast', () => {
     if (result.candidate) assert.ok(result.candidate.bars >= 2 && result.candidate.bars <= 23);
 });
 
-test('trend-break Fourier curve is anchored to the latest real price', () => {
+test('trend-break estimator reports robust Fourier fit diagnostics without forced anchoring', () => {
     const prices = Array.from({ length: 128 }, (_, i) => 100 + i * 0.02 + Math.sin(i / 6));
     const result = estimateTrendBreak(prices, 0.7, { harmonics: 3, horizon: 10 });
     assert.equal(result.ok, true);
-    assert.ok(Math.abs(result.forecast[0] - prices.at(-1)) < 1e-10);
     assert.equal(result.forecast.length, 11);
+    assert.ok(Number.isFinite(result.endpointError));
+    assert.ok(result.stability && Array.isArray(result.stability.windows));
+    if (!result.enabled) assert.equal(result.candidate, null);
 });
 
 test('Fourier component direction follows its phase into the next candle', () => {
@@ -349,15 +402,40 @@ test('trend-method simulation is causal and returns comparable bounded metrics',
     }
 });
 
-test('Fourier future projection is anchored and bounded to the requested horizon', () => {
+test('Fourier future projection is validated, adaptive and not forcibly anchored', () => {
     const prices = Array.from({ length: 128 }, (_, i) => 100 + i * 0.03 + Math.sin(2 * Math.PI * i / 24));
     const result = projectFourierToTargets(prices, 0.5, {
         harmonics: 5, horizonBars: 24, longTarget: 105, shortTarget: 98
     });
     assert.equal(result.ok, true);
     assert.equal(result.forecast.length, 25);
-    assert.ok(Math.abs(result.forecast[0] - prices.at(-1)) < 1e-9);
-    assert.equal(result.cycleDirections.length, 5);
+    assert.equal(result.endpointError, result.forecast[0] - prices.at(-1));
+    assert.ok(Number.isFinite(result.endpointErrorAtr));
+    assert.ok([64, 96, 128].includes(result.adaptiveWindow));
+    assert.ok(result.cycleDirections.length >= 1 && result.cycleDirections.length <= 5);
+    assert.ok(result.validationDirectionAccuracy >= 0 && result.validationDirectionAccuracy <= 1);
+    assert.ok(result.stability.windows.length >= 2);
+    assert.ok(Number.isFinite(result.stability.amplitudeCv));
+    assert.ok(result.stability.phaseCoherence >= 0 && result.stability.phaseCoherence <= 1);
+    if (!result.enabled) {
+        assert.ok(result.rejectionReasons.length >= 1);
+        assert.equal(result.disabledReason, result.rejectionReasons.join('; '));
+    }
+    assert.equal(result.cumulativeHistories.length, result.harmonics);
+    assert.equal(result.cumulativeForecasts.length, result.harmonics);
+    assert.equal(result.displayCumulativeHistories.length, result.requestedHarmonics);
+    assert.equal(result.displayCumulativeForecasts.length, result.requestedHarmonics);
+    assert.equal(result.displayCycleDirections.length, result.requestedHarmonics);
+    assert.ok(result.displayCycleDirections.some(cycle => cycle.retained));
+    for (let index = 1; index < result.cycleDirections.length; index++) {
+        for (let previous = 0; previous < index; previous++) {
+            assert.ok(Math.abs(result.cycleDirections[index].k - result.cycleDirections[previous].k) >= 0.5);
+        }
+    }
+    assert.deepEqual(result.cumulativeHistories.at(-1), result.fittedHistory);
+    assert.deepEqual(result.cumulativeForecasts.at(-1), result.forecast);
+    assert.ok(result.fitDiagnostics.rmse >= result.fitDiagnostics.mae);
+    assert.ok(result.fitDiagnostics.rmseAtr >= 0);
     assert.ok(result.alignment >= 0 && result.alignment <= 1);
 });
 
@@ -370,6 +448,45 @@ test('Fourier future dispersion widens with forecast distance', () => {
     const nearWidth = result.upperBand[1] - result.lowerBand[1];
     const farWidth = result.upperBand[10] - result.lowerBand[10];
     assert.ok(farWidth > nearWidth);
-    assert.equal(result.upperBand[0], result.forecast[0]);
-    assert.equal(result.lowerBand[0], result.forecast[0]);
+    assert.ok(result.upperBand[0] > result.forecast[0]);
+    assert.ok(result.lowerBand[0] < result.forecast[0]);
+    assert.ok(result.empiricalCoverage >= 0 && result.empiricalCoverage <= 1);
+});
+
+test('Fourier projection excludes cycles shorter than its minimum period', () => {
+    const prices = Array.from({ length: 128 }, (_, i) => 100 + i * 0.02 + Math.sin(2 * Math.PI * i / 24));
+    const result = projectFourierToTargets(prices, 0.5, { harmonics: 8, horizonBars: 20, minPeriodBars: 10 });
+    assert.equal(result.ok, true);
+    assert.equal(result.forecast.length, 21);
+    assert.ok(result.cycleDirections.every(component => component.period >= 10));
+});
+
+test('Fourier simulator preserves chronological 80/10/10 holdout splits', () => {
+    const prices = Array.from({ length: 160 }, (_, i) => 100 + i * 0.03 + Math.sin(2 * Math.PI * i / 20));
+    const result = simulateFourierHoldout(prices, { lookback: 64, harmonicCandidates: [1, 2], periodCandidates: [8, 10] });
+    assert.equal(result.ok, true);
+    assert.equal(result.splits.train.percent, 80);
+    assert.equal(result.splits.test.start, 128);
+    assert.equal(result.splits.real.start, 144);
+    assert.ok(result.splits.real.total > 0);
+    assert.ok(result.splits.real.accuracy >= 0 && result.splits.real.accuracy <= 1);
+});
+
+test('ATR strategy simulator applies configurable horizon and asymmetric scoring', () => {
+    const candles = Array.from({ length: 180 }, (_, i) => {
+        const close = 100 + i * 0.04 + Math.sin(2 * Math.PI * i / 18);
+        return { t: i * 600, o: close - 0.05, h: close + 0.30, l: close - 0.30, c: close, v: 100 };
+    });
+    const result = simulateFourierAtrStrategy(candles, {
+        horizonBars: 8, atrMultiple: 0.5, lookback: 64,
+        harmonicCandidates: [1, 2], periodCandidates: [8, 10]
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.horizonBars, 8);
+    assert.equal(result.atrMultiple, 0.5);
+    assert.deepEqual(result.scoring, { win: 1, loss: -2, unresolved: 0 });
+    for (const split of Object.values(result.splits)) {
+        assert.equal(split.score, split.wins - 2 * split.losses);
+        assert.equal(split.signals, split.wins + split.losses + split.unresolved);
+    }
 });

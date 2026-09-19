@@ -4,7 +4,7 @@
     right: 20px;
     width: min(var(--panel-width, 1320px), calc(100vw - 24px));
     height: min(var(--panel-height, 500px), calc(100vh - 80px));
-    min-width: 720px;
+    min-width: 440px;
     min-height: 340px;
     box-sizing: border-box;
     padding: 10px;
@@ -17,7 +17,9 @@
     font-size: 11px;
     touch-action: auto;
     overflow: hidden;
-    resize: both;
+    resize: none;
+    display: flex;
+    flex-direction: column;
 }
 
 #etoro-atr-plugin.is-dragging { cursor: grabbing !important; user-select: none; }
@@ -52,6 +54,7 @@
 
 #etoro-atr-plugin * { box-sizing: border-box; }
 .atr-header-row {
+    flex: 0 0 auto;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -60,6 +63,11 @@
     border-bottom: 1px solid #363a45;
     cursor: move;
     touch-action: none;
+}
+#atr-content-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
 }
 .atr-brand { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .atr-brand img { width: 20px; height: 20px; border-radius: 5px; }
@@ -72,6 +80,7 @@
     cursor: pointer;
 }
 #atr-min-btn:hover { color: #fff; }
+#download-diagnostic { white-space: nowrap; color: #9fc5ee; }
 #plugin-mode {
     width: 96px;
     height: 23px;
@@ -84,7 +93,126 @@
     font-size: 8px;
 }
 
-.plugin-grid { display: grid; grid-template-columns: var(--data-width, 260px) var(--fourier-width, 280px) var(--forecast-width, 350px) var(--wavelet-width, 300px) var(--scanner-width, 350px); gap: 10px; padding: 8px 0 9px; overflow-x: auto; overflow-y: hidden; scroll-behavior: smooth; scroll-snap-type: x proximity; touch-action: pan-x; scrollbar-width: auto; scrollbar-color: #5d7594 #20242d; }
+.plugin-grid { display: grid; grid-template-columns: var(--data-width, 280px) var(--fourier-width, 290px) var(--wavelet-width, 300px) var(--forecast-width, 400px); gap: 10px; padding: 8px 0 9px; overflow-x: auto; overflow-y: hidden; scroll-behavior: smooth; scroll-snap-type: x proximity; touch-action: pan-x; scrollbar-width: auto; scrollbar-color: #5d7594 #20242d; }
+.single-analysis-view {
+    height: 100%;
+    min-height: 0;
+    padding: 8px 2px 10px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-color: #4b5565 #20242d;
+    scrollbar-width: thin;
+    touch-action: pan-y;
+}
+.single-analysis-view::-webkit-scrollbar { width: 9px; }
+.single-analysis-view::-webkit-scrollbar-track { border-radius: 8px; background: #20242d; }
+.single-analysis-view::-webkit-scrollbar-thumb { border: 2px solid #20242d; border-radius: 8px; background: #5d7594; }
+.single-analysis-view::-webkit-scrollbar-thumb:hover { background: #7e9abb; }
+.analysis-workspace { display: grid; grid-template-columns: minmax(0, 1fr) 245px; gap: 10px; align-items: start; }
+.unified-panel { width: 100%; min-width: 0; }
+.unified-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 14px;
+    margin: 8px 0 5px;
+    padding: 6px 8px;
+    border: 1px solid #343c4a;
+    border-radius: 6px;
+    color: #97a2b1;
+    background: #202635;
+}
+.unified-controls > span { display: inline-flex; align-items: center; gap: 5px; }
+.unified-controls label { display: inline-flex !important; align-items: center; gap: 5px; }
+.unified-controls label select { width: 62px !important; height: 23px !important; margin: 0 !important; }
+#chart-price-mode, #chart-trade-side { width: 105px !important; }
+.layer-controls { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 4px 0; }
+.layer-controls label { display: inline-flex !important; align-items: center; gap: 4px; color: #aab4c2 !important; }
+.layer-controls input { margin: 0; accent-color: #4f8cff; }
+.fourier-simulator { position: sticky; top: 0; padding: 9px; border: 1px solid #3c485a; border-radius: 7px; background: rgba(25,32,43,.92); }
+.fourier-simulator h3 { margin: 0 0 5px; color: #e4edf7; font-size: 11px; }
+.fourier-simulator > p, .fourier-simulator #fourier-simulation-output > p { color: #8490a0; font-size: 8px; line-height: 1.4; }
+#run-fourier-simulation { width: 100%; margin: 5px 0 7px; }
+.simulation-controls { display: grid; gap: 6px; margin: 7px 0; }
+.simulation-controls input { height: 25px !important; }
+.simulation-scoring { padding: 4px; border-radius: 4px; color: #ffd166; background: rgba(255,209,102,.08); font-size: 8px; text-align: center; }
+#fourier-simulation-output { display: grid; gap: 5px; }
+.simulation-params { padding: 5px; border-radius: 4px; color: #9fc5ee; background: #202635; font-size: 8px; line-height: 1.35; }
+.simulation-result { display: grid; grid-template-columns: 1fr auto; gap: 2px 5px; padding: 6px; border: 1px solid #354052; border-radius: 5px; }
+.simulation-result b { color: #aeb9c7; }
+.simulation-result strong { color: #55e8a2; font-size: 13px; }
+.simulation-result strong.score-negative { color: #ff7d7d; }
+.simulation-result span, .simulation-result small { grid-column: 1 / -1; color: #7f8a99; font-size: 7px; }
+.simulation-error { color: #ff8a80; }
+.simulation-details { margin-top: 3px; color: #9fc5ee; font-size: 8px; }
+.simulation-details summary { cursor: pointer; }
+.simulation-record { display: grid; gap: 2px; margin-top: 4px; padding: 4px; border-radius: 4px; background: #202635; }
+.simulation-record b { color: #dce8f5; }
+.simulation-record span, .simulation-record small { color: #8491a1; font-family: monospace; font-size: 7px; }
+.unified-legend { display: flex; flex-wrap: wrap; gap: 5px 14px; margin: 4px 0; font-size: 8px; }
+.legend-real { color: #00e676; }
+.legend-fourier-cycles { color: #4fc3f7; }
+.legend-fourier-steps { color: #7dd3fc; }
+.legend-fourier { color: #ff5252; }
+.legend-wavelet { color: #ffb74d; }
+.legend-projection { color: #e967ff; }
+.legend-band { color: rgba(233, 103, 255, .75); }
+.legend-atr { color: #ffd166; }
+.legend-tp { color: #55e8a2; }
+.legend-sl { color: #ff7d7d; }
+.legend-market { color: #dbeafe; }
+#unified-analysis-canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 5 / 2;
+    border: 1px solid #303846;
+    border-radius: 6px;
+    background: #11151d;
+}
+#plugin-resize-handle {
+    position: absolute;
+    right: 1px;
+    bottom: 1px;
+    z-index: 20;
+    width: 22px;
+    height: 22px;
+    cursor: nwse-resize;
+    touch-action: none;
+    background: linear-gradient(135deg, transparent 45%, #65758a 47%, #65758a 54%, transparent 56%, transparent 66%, #8da0b8 68%, #8da0b8 75%, transparent 77%);
+}
+#etoro-atr-plugin > #plugin-resize-handle { flex: 0 0 auto; }
+#etoro-atr-plugin.atr-minimized #plugin-resize-handle { display: none; }
+.operation-column { order: 1; }
+.fourier-column { order: 2; }
+.wavelet-column { order: 3; }
+.forecast-column { order: 4; }
+.market-core-metrics { display: grid; grid-template-columns: 1fr; gap: 4px; margin: 6px 0; }
+.market-core-metrics span { display: flex; justify-content: space-between; gap: 8px; color: #8995a4; font-size: 8px; }
+.market-core-metrics b { color: #e0e8f1; text-align: right; }
+.signal-breakdown { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; margin: 7px 0; padding: 6px; border: 1px solid #354052; border-radius: 6px; background: rgba(25,32,43,.72); }
+.signal-breakdown span { display: grid; gap: 2px; color: #7f8b9b; font-size: 8px; }
+.signal-breakdown b { color: #dce7f3; font-size: 9px; }
+.discrepancy-panel { margin: 6px 0; padding: 5px 7px; border: 1px solid #4a4350; border-radius: 6px; background: rgba(48,38,48,.55); }
+.discrepancy-panel summary { color: #e1b8d5; font-size: 9px; font-weight: 700; cursor: pointer; }
+#discrepancy-output { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 10px; margin-top: 6px; color: #919cab; font-size: 8px; line-height: 1.35; }
+#discrepancy-output span { display: flex; justify-content: space-between; gap: 5px; }
+#discrepancy-output b { color: #e4eaf1; text-align: right; }
+#discrepancy-output .discrepancy-warning b { color: #ffd166; }
+#discrepancy-output .discrepancy-bad b { color: #ff7d7d; }
+#original-price-canvas { width: 100%; height: 100px; border: 1px solid #303846; border-radius: 4px; background: #11151d; }
+.trade-side { margin-top: 6px; }
+.trade-side h4 { margin: 0 0 4px; color: #9fc5ee; font-size: 9px; }
+.trade-combination { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 7px; margin-bottom: 5px; padding: 5px; border: 1px solid #354052; border-radius: 5px; background: rgba(25,32,43,.8); font-size: 7.5px; }
+.trade-combination > b { grid-column: 1 / -1; color: #f0f5fa; }
+.trade-combination span { color: #8c98a8; }
+.trade-combination strong { color: #dfe8f1; }
+.trade-combination .margin-positive strong { color: #55e8a2; }
+.trade-combination .margin-negative strong { color: #ff7d7d; }
+.fourier-cycle-row small { color: #798697; }
+.fourier-cycle-row.cycle-excluded { opacity: .68; border-left: 3px dashed #697586; }
 .plugin-grid::-webkit-scrollbar { height: 9px; }
 .plugin-grid::-webkit-scrollbar-track { border-radius: 8px; background: #20242d; }
 .plugin-grid::-webkit-scrollbar-thumb { border: 2px solid #20242d; border-radius: 8px; background: #5d7594; }
@@ -237,7 +365,7 @@
 .gradient.bullish { background: #00e676; }
 .wavelet-scales { margin-left: auto; color: #8b91a0; }
 #w-count-label { min-width: 12px; color: #b388ff; text-align: center; }
-#wavelet-components { min-height: 12px; color: #aa95dd; font-size: 8px; line-height: 1.35; }
+#wavelet-components { min-height: 12px; margin-top: 8px; padding-top: 7px; border-top: 1px solid #343c4a; color: #aa95dd; font-size: 8px; line-height: 1.45; }
 .cycles-toolbar { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: #949aa8; }
 .cycles-toolbar span { margin-right: auto; }
 .atr-btn {
@@ -250,7 +378,7 @@
 }
 .atr-btn:hover { background: #3a4355; }
 #k-count-label { min-width: 12px; color: #4fc3f7; text-align: center; }
-#fourier-top-list { max-height: 38px; overflow-y: auto; color: #61c9f5; font-size: 8px; }
+#fourier-top-list { max-height: 190px; padding-right: 3px; overflow-y: auto; color: #61c9f5; font-size: 8px; }
 .trade-plan-panel { margin-top: 8px; padding: 7px; border: 1px solid #3d4d61; border-radius: 6px; background: rgba(25, 35, 49, .72); }
 .trade-plan-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 6px; color: #e2e9f2; font-size: 10px; }
 #trade-plan-side { width: 76px !important; height: 23px !important; margin: 0 !important; padding: 2px 4px !important; }
@@ -267,9 +395,15 @@
 .plan-alert { padding: 3px 4px; border-radius: 3px; font-size: 8px; line-height: 1.3; }
 .plan-alert.ok { color: #8ff0bc; background: rgba(0, 170, 95, .12); }
 .plan-alert.bad, .plan-warning { color: #ffad9f; background: rgba(210, 65, 52, .12); }
-.fourier-cycle-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 6px; margin: 3px 0; }
-.fourier-cycle-row b { color: #b8c1cf; font-family: monospace; font-size: 8px; }
-.fourier-cycle-row strong { grid-column: 1 / -1; font-size: 8px; text-align: right; }
+.fourier-cycle-row { display: grid; gap: 4px; margin: 5px 0; padding: 6px 7px; border: 1px solid #354052; border-radius: 5px; background: rgba(27,34,46,.75); }
+.fourier-cycle-head { display: grid; grid-template-columns: minmax(70px,.55fr) minmax(110px,1fr) minmax(52px,auto); align-items: center; gap: 6px; }
+.fourier-cycle-head > span { color: #61c9f5; font-weight: 700; }
+.fourier-cycle-head b { color: #b8c1cf; font-family: monospace; font-size: 8px; text-align: center; }
+.fourier-cycle-head strong { font-size: 8px; text-align: right; }
+.fourier-cycle-state { color: #9ba8b8; font-size: 7px; font-weight: 700; letter-spacing: .03em; }
+.fourier-cycle-metrics { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 4px 12px; color: #7f8b9a; }
+.fourier-cycle-metrics span { display: flex; justify-content: space-between; gap: 5px; }
+.fourier-cycle-metrics b { color: #d6dee8; font-family: monospace; }
 .cycle-up { color: #55e8a2; }
 .cycle-down { color: #ff7d7d; }
 .cycle-turning { color: #ffd166; }
@@ -366,4 +500,6 @@
     .plugin-grid { grid-template-columns: 1fr; }
     .plugin-column { height: min(360px, calc(100vh - 155px)); }
     .analysis-column { padding: 8px 5px 0 0; border-left: 0; border-top: 1px solid #363a45; }
+    .analysis-workspace { grid-template-columns: 1fr; }
+    .fourier-simulator { position: static; }
 }

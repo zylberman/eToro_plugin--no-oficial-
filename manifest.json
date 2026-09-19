@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "eToro ATR Assistant",
-  "version": "2.19",
+  "version": "2.37",
   "description": "Calculates ATR, break-even TP and exploratory Fourier/Haar signals.",
   "icons": {
     "16": "icons/icon16.png",

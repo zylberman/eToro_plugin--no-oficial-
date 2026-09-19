@@ -7,6 +7,7 @@
      */
     const N = 128;                       // Sample size (analysis window)
     let candlesHistory  = [];            // OHLC candle buffer
+    let rawYahooCandles = [];            // Unmodified source data for diagnostics
     let lastClose       = null;          // Latest detected close
     let lastTimeframe   = null;          // Current chart timeframe
     let lastSymbol      = null;          // Current asset symbol
@@ -15,6 +16,10 @@
     let isSyncing       = false;         // Prevent duplicate downloads
     let visibleCyclesCount = 1;          // Number of harmonics to display
     let visibleWaveletLevels = 2;         // Highest-energy Haar components
+    let visibleHistoryCount = Number(localStorage.getItem('atr-plugin-history-count') || 128);
+    let projectionBars = Number(localStorage.getItem('atr-plugin-projection-bars') || 20);
+    let chartPriceMode = localStorage.getItem('atr-plugin-chart-mode') || 'candles';
+    let chartTradeSide = localStorage.getItem('atr-plugin-chart-side') || 'auto';
     let lastMarketPrice = null;           // Base price for break-even TP
     let lastPriceSource = 'Yahoo Finance';
     let lastBidPrice = null;
@@ -24,6 +29,8 @@
     let lastCombinedAnalysis = null;
     let lastAtrValue = null;
     let historyAlignedToEtoro = false;
+    let historyScaleFactor = 1;
+    let historyPriceOffset = 0;
     let scannerTimer = null;
     let scannerRunning = false;
     let lastFutureProjection = null;
@@ -34,8 +41,8 @@
     let liveCandle = null;
     const SCANNER_ASSETS = [
         { symbol: 'VOO', yahoo: 'VOO', name: 'S&P 500 ETF' },
-        { symbol: 'VT', yahoo: 'VT', name: 'Mundo ETF' },
-        { symbol: 'BND', yahoo: 'BND', name: 'Bonos ETF' },
+        { symbol: 'VT', yahoo: 'VT', name: 'World ETF' },
+        { symbol: 'BND', yahoo: 'BND', name: 'Bond ETF' },
         { symbol: 'QQQ', yahoo: 'QQQ', name: 'Nasdaq 100 ETF' },
         { symbol: 'BTC', yahoo: 'BTC-USD', name: 'Bitcoin' },
         { symbol: 'ETH', yahoo: 'ETH-USD', name: 'Ethereum' }
@@ -68,7 +75,7 @@
             }
             .atr-btn:hover { background: #3d414d; }
             #etoro-atr-plugin canvas { width: 100%; border-radius: 4px; background: #000; border: 1px solid #2a2e39; }
-            #fourier-top-list { font-size: 0.72em; color: #4fc3f7; max-height: 100px; overflow-y: auto; }
+            #fourier-top-list { font-size: 0.72em; color: #4fc3f7; max-height: 190px; overflow-y: auto; }
 
             @keyframes spin { 100% { transform: rotate(360deg); } }
             .spinning { animation: spin 1s linear infinite; display: inline-block; }
@@ -141,6 +148,15 @@
         return { bid, ask };
     };
 
+    const timeframeToMinutes = value => {
+        const normalized = String(value || '').toLowerCase();
+        const amount = parseFloat(normalized) || 1;
+        if (normalized.includes('wk') || normalized.includes('w')) return amount * 10080;
+        if (normalized.includes('d')) return amount * 1440;
+        if (normalized.includes('h')) return amount * 60;
+        return amount;
+    };
+
     // Map eToro terms to Yahoo Finance-compatible symbols.
     const mapToYahoo = (symbol, timeframe) => {
         const symbolMap = { 
@@ -148,8 +164,9 @@
             'COPPER': 'HG=F', 'BTC': 'BTC-USD', 'ETH': 'ETH-USD' 
         };
         
-        const intervalMap = { 
+        const intervalMap = {
             '1m': '1m',   '2m': '2m',   '5m': '5m', 
+            '10m': '5m',
             '15m': '15m', '30m': '30m', '60m': '60m', 
             '1h': '1h',   '4h': '1h',   '1d': '1d',  '1w': '1wk' 
         };
@@ -157,8 +174,39 @@
         const ySymbol   = symbolMap[symbol] || symbol;
         let yInterval   = intervalMap[timeframe] || (timeframe.includes('m') ? '5m' : '1d');
 
-        console.log(`[DEBUG] Mapeo Yahoo - ySymbol: ${ySymbol}, yInterval: ${yInterval}`);
-        return { ySymbol, yInterval };
+        const sourceMinutes = timeframeToMinutes(yInterval);
+        const targetMinutes = timeframeToMinutes(timeframe);
+        const aggregateFactor = targetMinutes > sourceMinutes && targetMinutes % sourceMinutes === 0
+            ? targetMinutes / sourceMinutes : 1;
+        console.log(`[DEBUG] Mapeo Yahoo - ySymbol: ${ySymbol}, yInterval: ${yInterval}, aggregate: ${aggregateFactor}`);
+        return { ySymbol, yInterval, sourceMinutes, targetMinutes, aggregateFactor };
+    };
+
+    const normalizeYahooCandles = (candles, sourceMinutes, targetMinutes) => {
+        return window.EToroAnalytics.aggregateCandlesToTimeframe(
+            candles, sourceMinutes, targetMinutes, Math.floor(Date.now() / 1000)
+        ).map(candle => ({ ...candle, source: 'yahoo-proxy' }));
+    };
+
+    const observedEtoroKey = (symbol, timeframe) => `atr-etoro-observed-${symbol}-${timeframe}`;
+    const loadObservedEtoroCandles = (symbol, timeframe) => {
+        try {
+            const stored = JSON.parse(localStorage.getItem(observedEtoroKey(symbol, timeframe)) || '[]');
+            return stored.filter(candle => Number.isFinite(candle.t) && Number.isFinite(candle.c))
+                .map(candle => ({ ...candle, source: 'etoro-observed', partial: false }));
+        } catch { return []; }
+    };
+    const saveObservedEtoroCandle = (symbol, timeframe, candle) => {
+        if (!symbol || !timeframe || !candle || !Number.isFinite(candle.t) || !Number.isFinite(candle.c)) return;
+        const merged = new Map(loadObservedEtoroCandles(symbol, timeframe).map(item => [item.t, item]));
+        merged.set(candle.t, { ...candle, source: 'etoro-observed', partial: false });
+        const compact = [...merged.values()].sort((a, b) => a.t - b.t).slice(-2000);
+        localStorage.setItem(observedEtoroKey(symbol, timeframe), JSON.stringify(compact));
+    };
+    const mergeObservedEtoroCandles = (proxyCandles, symbol, timeframe) => {
+        const merged = new Map(proxyCandles.map(candle => [candle.t, candle]));
+        loadObservedEtoroCandles(symbol, timeframe).forEach(candle => merged.set(candle.t, candle));
+        return [...merged.values()].sort((a, b) => a.t - b.t);
     };
 
 
@@ -225,7 +273,7 @@
                     return candles;
                 }
             } catch (e) {
-                console.warn(`[ATR] Fallo proxy: ${config.url.split('/')[2]}`);
+                console.warn(`[ATR] Proxy failed: ${config.url.split('/')[2]}`);
             }
         }
 
@@ -326,7 +374,7 @@
     const savedTradeSide = localStorage.getItem('atr-plugin-trade-side') || 'long';
     const isMinimized = localStorage.getItem('atr-plugin-minimized') === 'true';
     
-    // --- Estructura HTML ---
+    // HTML structure.
     /* ========================================================================
    SECTION 5: SIMPLIFIED UI
    ======================================================================== */
@@ -335,31 +383,15 @@
             <div class="atr-brand"><img src="${chrome.runtime.getURL('icons/icon32.png')}" alt=""><div class="atr-header">Price, Risk and Trend Assistant</div></div>
             <div id="conn-indicator" style="width: 8px; height: 8px; border-radius: 50%; background: #ff5252; margin-left: 5px;" title="Connection status"></div>
             <div style="display: flex; gap: 5px; align-items: center;">
-                <select id="plugin-mode" title="Switch between the trading summary and full analysis">
-                    <option value="simple">Simple mode</option>
-                    <option value="analysis">Analysis mode</option>
-                </select>
-                <button id="columns-left" class="atr-btn column-nav" title="Show columns to the left">◀</button>
-                <button id="columns-right" class="atr-btn column-nav" title="Show columns to the right">▶</button>
-                <button id="download-diagnostic" class="atr-btn" title="Download asset data and diagnostics">⇩ Data</button>
-                <button id="layout-toggle" class="atr-btn" title="Resize the panel and columns">↔</button>
+                <button id="download-diagnostic" class="atr-btn" title="Download plugin and eToro comparison data">↓ JSON</button>
                 <button id="atr-refresh-btn" class="atr-btn" title="Refresh all data">⟳</button>
                 <button id="atr-min-btn">${isMinimized ? '▢' : '_'}</button>
             </div>
         </div>
 
         <div id="atr-content-body" style="${isMinimized ? 'display: none;' : 'display: block;'}">
-            <div id="layout-controls" class="layout-controls" hidden>
-                <label>Panel width<input type="range" data-layout="panelWidth" min="1000" max="1900" step="20"></label>
-                <label>Panel height<input type="range" data-layout="panelHeight" min="360" max="900" step="20"></label>
-                <label>Data<input type="range" data-layout="dataWidth" min="250" max="400" step="10"></label>
-                <label>Fourier<input type="range" data-layout="fourierWidth" min="270" max="420" step="10"></label>
-                <label>Trade plan<input type="range" data-layout="forecastWidth" min="330" max="480" step="10"></label>
-                <label>Wavelet<input type="range" data-layout="waveletWidth" min="290" max="440" step="10"></label>
-                <label>Scanner<input type="range" data-layout="scannerWidth" min="350" max="500" step="10"></label>
-            </div>
-            <div class="plugin-grid">
-                <section class="plugin-column operation-column">
+            <div class="single-analysis-view"><div class="analysis-workspace">
+                <section class="unified-panel">
                     <div class="summary-line">
                         <b id="atr-status">Synchronizing...</b>
                         <span title="Average true range of the latest 14 candles, in price units per candle.">ATR(14) per candle <b id="val-atr">0.00</b></span>
@@ -379,158 +411,88 @@
                             </select>
                         </label>
                     </div>
-                    <div class="cost-panel">
-                        <div class="cost-title">Minimum price required to recover costs</div>
-                        <div id="fee-profile">Identifying fee profile…</div>
-                        <div id="breakeven-output">Waiting for price…</div>
-                        <div class="cost-note">Break-even means gross profit equals estimated opening and closing costs. It is not a sell recommendation.</div>
-                    </div>
                     <div class="ohlc-title">Latest detected candle</div>
                     <div class="atr-ohlc">
                         O <span id="val-o">-</span> · H <span id="val-h">-</span> · L <span id="val-l">-</span> · C <span id="val-c">-</span>
                     </div>
-                    <div id="trend-summary-legend">
-                        <span title="Logarithmic slope of the latest 16 closes.">16-candle direction <b id="txt-current-status">--</b></span>
-                        <span title="Direction and time until the Fourier slope changes sign.">Possible Fourier turn <b id="txt-consensus">--</b></span>
-                        <span title="Central curve price at the possible turn; not a guaranteed target.">Turn price <b id="txt-turn-price">--</b></span>
-                        <span title="Independent multiscale confirmation from the Haar Wavelet.">Wavelet confirmation <b id="txt-reversal">--</b></span>
+                    <div class="market-core-metrics">
+                        <span>ATR(14) <b id="current-atr-distance">--</b></span>
+                        <span>Recommended SL distance <b id="recommended-atr">--</b></span>
+                        <span>Rolling VWAP(21) <b id="metric-vwap">--</b></span>
+                        <span>16-candle log trend <b id="metric-log-trend">--</b></span>
                     </div>
-                    <div class="levels-panel">
-                        <div class="levels-title">Wavelet price zones</div>
-                        <div class="wavelet-zone-columns">
-                            <label title="Lower zone where price declines have stalled.">Supports<select id="wavelet-supports"><option>--</option></select></label>
-                            <label title="Upper zone where price advances have stalled.">Resistances<select id="wavelet-resistances"><option>--</option></select></label>
-                        </div>
-                        <div><span>Current ATR</span><b id="current-atr-distance">--</b></div>
-                        <div><span>Minimum SL distance</span><b id="recommended-atr">--</b></div>
-                        <span title="Weighted score; it is not a probability of success.">Combined score <b id="combined-score">--</b></span>
-                        <details class="help-box"><summary>What does this column mean?</summary><p><b>ATR</b>: ordinary movement per candle. <b>Support</b>: possible floor. <b>Resistance</b>: possible ceiling. The dollar amount estimates how much the position would change if price reached that zone.</p></details>
+                    <div class="signal-breakdown">
+                        <span>Price trend <b id="signal-price-trend">--</b></span>
+                        <span>Fourier direction <b id="signal-fourier-direction">--</b></span>
+                        <span>Wavelet regime <b id="signal-wavelet-regime">--</b></span>
+                        <span>Final consensus <b id="signal-consensus">--</b></span>
+                        <span>Method conflict <b id="signal-conflict">--</b></span>
+                        <span>Empirical confidence <b id="signal-confidence">--</b></span>
                     </div>
-                </section>
-
-                <section class="plugin-column analysis-column fourier-column">
-                    <div class="analysis-head">
-                        <b>Fourier price cycles</b>
+                    <details class="discrepancy-panel" open>
+                        <summary>Data and model discrepancies</summary>
+                        <div id="discrepancy-output">Waiting for comparable prices and model fit…</div>
+                    </details>
+                    <div class="unified-controls">
                         <span><span id="f-samples">--</span> candles · <span id="f-tf">--</span></span>
+                        <label>Visible candles <select id="history-count"><option>32</option><option>64</option><option selected>128</option></select></label>
+                        <label>Projected candles <select id="projection-count"><option>5</option><option>10</option><option selected>20</option><option>30</option><option>40</option></select></label>
+                        <label>Price display <select id="chart-price-mode"><option value="candles">OHLC candles</option><option value="close">Close price</option></select></label>
+                        <label>Trade side <select id="chart-trade-side"><option value="auto">Auto</option><option value="long">Buy / LONG</option><option value="short">Sell / SHORT</option></select></label>
+                        <span>Fourier harmonics <button id="k-minus" class="atr-btn">−</button><b id="k-count-label">1</b><button id="k-plus" class="atr-btn">+</button></span>
+                        <span>Wavelet levels <button id="w-minus" class="atr-btn">−</button><b id="w-count-label">2</b><button id="w-plus" class="atr-btn">+</button></span>
                     </div>
-                    <div class="chart-title">Fourier spectrum <small>Tall bars = dominant cycles</small></div>
-                    <canvas id="fourier-canvas" width="240" height="54"></canvas>
-                    <div class="chart-legend"><span class="dot dominant"></span>Dominant <span class="dot secondary"></span>Other frequencies · <b id="fourier-cycle">Loading…</b></div>
-
-                    <div class="chart-title reconstruction-title">Price and reconstruction</div>
-                    <div id="recon-legend" class="chart-legend reconstruction-legend">
-                        <span class="dot real"></span>Actual price
-                        <span class="dot cycles"></span>Cycles
-                        <span class="dot total"></span>Trend + cycles
-                        <label><input type="checkbox" id="chk-show-price" checked> Show price</label>
+                    <div class="layer-controls">
+                        <label><input type="checkbox" id="show-fourier" checked> Fourier</label>
+                        <label><input type="checkbox" id="show-atr" checked> ATR</label>
+                        <label><input type="checkbox" id="show-tp" checked> TP</label>
+                        <label><input type="checkbox" id="show-sl" checked> SL</label>
                     </div>
-                    <canvas id="reconstruction-canvas" width="240" height="62"></canvas>
-                    <div class="time-legend">
-                        <span>Start <b id="leg-time">--:--</b></span>
-                        <span>Latest <b id="leg-mkt-last">--:--</b></span>
-                        <span>Slope/candle <b id="leg-slope">0.0000</b></span>
+                    <div class="chart-title">Unified price analysis · <b id="fourier-cycle">Loading…</b></div>
+                    <div class="unified-legend">
+                        <span class="legend-real">● Historical OHLC (eToro when observed; otherwise adjusted Yahoo proxy)</span>
+                        <span class="legend-fourier-cycles">● Fourier cycles</span>
+                        <span class="legend-fourier-steps">● C1…Cn cumulative spectral fits</span>
+                        <span class="legend-fourier">● Fourier trend + cycles</span>
+                        <span class="legend-wavelet">● Wavelet</span>
+                        <span class="legend-projection">● <b id="projection-legend-count">20</b>-candle projection</span>
+                        <span class="legend-band">■ Dispersion</span>
+                        <span class="legend-atr">━ Directional ATR</span>
+                        <span class="legend-tp">┄ TP</span>
+                        <span class="legend-sl">┄ SL</span>
+                        <span class="legend-market">┄ eToro executable entry</span>
                     </div>
-
-                    <div class="cycles-toolbar">
-                        <span>Active harmonics</span>
-                        <button id="k-minus" class="atr-btn">−</button>
-                        <b id="k-count-label">1</b>
-                        <button id="k-plus" class="atr-btn">+</button>
-                    </div>
-                    <div id="fourier-top-list"></div>
-                    <details class="help-box"><summary>How to read Fourier</summary><p>It separates history into cycles. A tall bar indicates a dominant cycle but does not guarantee persistence. The red line combines trend and cycles; the blue line shows cycles only.</p></details>
-                </section>
-
-                <section class="plugin-column analysis-column forecast-column">
-                    <div class="analysis-head">
-                        <b>Projection and trade plan</b>
-                        <span>Next 10 candles</span>
-                    </div>
-                    <div class="chart-title reconstruction-title">Future Fourier path</div>
-                    <canvas id="fourier-forecast-canvas" width="240" height="62"></canvas>
+                    <canvas id="unified-analysis-canvas" width="900" height="360"></canvas>
                     <div id="fourier-forecast-output" class="forecast-output">Waiting for projection…</div>
                     <div id="fourier-price-list" class="future-price-list"></div>
-                    <div class="entry-filter-panel">
-                        <div class="trade-plan-head"><b>Is opening now worthwhile?</b><span id="entry-decision">NOT VIABLE</span></div>
-                        <div id="market-filter-summary">Waiting for regime, volume and volatility…</div>
-                        <div id="entry-checks"></div>
-                    </div>
-                    <div class="simulation-panel">
-                        <button id="trend-simulation-btn" class="atr-btn">Simulate log-price vs Fourier ×5</button>
-                        <div id="trend-simulation-output">Uses loaded candles and predicts only the next candle.</div>
-                    </div>
+                    <div id="fourier-top-list"></div>
+                    <div id="wavelet-components">Waiting for Wavelet data…</div>
                     <div class="trade-plan-panel">
                         <div class="trade-plan-head">
-                            <b>Price, gain and loss</b>
-                            <select id="trade-plan-side">
-                                <option value="long" ${savedTradeSide === 'long' ? 'selected' : ''}>LONG</option>
-                                <option value="short" ${savedTradeSide === 'short' ? 'selected' : ''}>SHORT</option>
-                            </select>
+                            <b>LONG and SHORT TP/SL combinations</b>
                         </div>
                         <div id="trade-plan-output">Waiting for Wavelet zones…</div>
-                        <div class="trade-plan-note">Assuming the Fourier path occurs, a setup is viable only if it reaches TP within 10 candles, TP/SL ≥ 1.5, SL ≥ 1.50 ATR, and gross profit covers at least 2× the full round-trip cost. Wavelet defines the zones; an ATR/RR fallback is identified when a usable pair is missing.</div>
-                        <details class="help-box"><summary>Decision glossary</summary><p><b>ADX</b>: trend strength. <b>ER</b>: directional efficiency from 0 to 1. <b>Relative volume</b>: current volume versus its average. <b>VWAP</b>: volume-weighted average price. <b>R/R</b>: dollars sought for each dollar at risk.</p></details>
+                        <div class="trade-plan-note">Dollar values convert the distance from the current executable price. Margin equals TP gross profit minus estimated opening and closing costs.</div>
                     </div>
                 </section>
-
-                <section class="plugin-column analysis-column wavelet-column">
-                    <div class="analysis-head">
-                        <b>Wavelet zones and scales</b>
-                        <span>Haar · 128 candles</span>
-                    </div>
-                    <div class="chart-title wavelet-title">Haar Wavelet reconstruction <small>Multiscale components</small></div>
-                    <div class="chart-legend wavelet-legend">
-                        <span class="dot real"></span>Actual price
-                        <span class="dot wave-components"></span>Components
-                        <span class="dot wave-total"></span>Reconstruction
-                    </div>
-                    <canvas id="wavelet-canvas" width="240" height="62"></canvas>
-                    <div class="chart-legend wavelet-legend">
-                        <span>Active components</span>
-                        <button id="w-minus" class="atr-btn">−</button>
-                        <b id="w-count-label">2</b>
-                        <button id="w-plus" class="atr-btn">+</button>
-                    </div>
-                    <div id="wavelet-components">Waiting for data…</div>
-                    <details class="help-box"><summary>How to read Wavelet</summary><p>It separates fast and slow movements to locate repeated turning zones. More contacts and greater recency increase the score, but a zone remains a range rather than one exact price.</p></details>
-                    <div class="model-info-panel">
-                        <div class="model-info-title">Equations and calibration</div>
-                        <div class="equation-line"><b>Combination</b> C = (F·wF + W·wW + A·wA) / Σw</div>
-                        <div class="equation-line"><b>Fourier</b> F = min(1, movement / (2·minimum movement))</div>
-                        <div class="equation-line"><b>Wavelet</b> W = contacts × zone recency</div>
-                        <div class="equation-line"><b>Alignment</b> A = max(0, 1 − distance / (2·ATR))</div>
-                        <div id="model-parameters">wF -- · wW -- · wA -- · threshold --</div>
-                        <div class="split-grid">
-                            <span>Train 80% <b id="split-train">--</b></span>
-                            <span>Test 10% <b id="split-test">--</b></span>
-                            <span>Validate 10% <b id="split-validation">--</b></span>
-                        </div>
-                        <div id="calibration-status">Historical calibration pending…</div>
-                        <div id="calibration-updated">Last update: --</div>
-                    </div>
-                </section>
-
-                <section class="plugin-column analysis-column scanner-column">
-                    <div class="analysis-head">
-                        <b>Opportunity scanner</b>
-                        <button id="scanner-refresh" class="atr-btn" title="Scan now">Scan</button>
-                    </div>
-                    <div class="scanner-controls">
-                        <label>Update every
-                            <select id="scanner-interval">
-                                <option value="5">5 minutes</option>
-                                <option value="10" selected>10 minutes</option>
-                            </select>
+                <aside class="fourier-simulator">
+                    <h3>Fourier historical simulator</h3>
+                    <p>Define when a projected trend counts as fulfilled. Parameters are selected only with the first 80%; they remain fixed for Test and Real.</p>
+                    <div class="simulation-controls">
+                        <label>Maximum candles after prediction
+                            <input type="number" id="simulation-horizon" min="1" max="100" step="1" value="10">
                         </label>
-                        <span id="scanner-updated">Not scanned</span>
+                        <label>Target distance in ATR
+                            <input type="number" id="simulation-atr-multiple" min="0.1" max="10" step="0.1" value="1">
+                        </label>
                     </div>
-                    <div class="scanner-note">Compares VOO, VT, BND, QQQ, BTC and ETH on 15m, 30m, 1h and 4h using five Fourier cycles. Yahoo prices are indicative; always confirm in eToro.</div>
-                    <div id="scanner-progress"></div>
-                    <div id="scanner-results"><div class="scanner-empty">Press Scan to start.</div></div>
-                    <details class="help-box"><summary>How results are ranked</summary><p>Low, medium and high risk appear in that order. Within each level, the highest potential net gain relative to loss and costs appears first. The six checks remain visible as evidence. If Wavelet has no usable TP, the fallback uses <b>TP ≥ 1.5 × SL</b> and increases it only when required to cover costs.</p></details>
-                </section>
-            </div>
+                    <div class="simulation-scoring">Win = +1 · Loss = −2 · Unresolved = 0</div>
+                    <button id="run-fourier-simulation" class="atr-btn">Run simulation</button>
+                    <div id="fourier-simulation-output">Waiting to run…</div>
+                </aside>
+            </div></div>
         </div>
+        <div id="plugin-resize-handle" title="Drag to resize"></div>
     `;
 
     // Inject into the DOM.
@@ -538,35 +500,23 @@
     ui.classList.toggle('atr-minimized', isMinimized);
 
     document.body.appendChild(ui);
-    const savedMode = localStorage.getItem('atr-plugin-mode') || 'simple';
-    document.getElementById('plugin-mode').value = savedMode;
-    ui.classList.toggle('mode-simple', savedMode === 'simple');
-    ui.classList.toggle('mode-analysis', savedMode === 'analysis');
-    document.getElementById('scanner-interval').value = localStorage.getItem('atr-scanner-interval') || '10';
-    const defaultLayout = { panelWidth: 1580, panelHeight: 540, dataWidth: 260, fourierWidth: 280, forecastWidth: 350, waveletWidth: 300, scannerWidth: 350 };
-    const layoutMinimums = { panelWidth: 1000, panelHeight: 360, dataWidth: 250, fourierWidth: 270, forecastWidth: 330, waveletWidth: 290, scannerWidth: 350 };
-    const storedLayout = JSON.parse(localStorage.getItem('atr-plugin-layout') || '{}');
-    const savedLayout = Object.fromEntries(Object.entries(defaultLayout).map(([key, fallback]) => [
-        key, Math.max(layoutMinimums[key] || 0, Number(storedLayout[key]) || fallback)
-    ]));
-    const applyLayout = layout => {
-        ui.style.setProperty('--panel-width', `${layout.panelWidth}px`);
-        ui.style.setProperty('--panel-height', `${layout.panelHeight}px`);
-        ui.style.setProperty('--data-width', `${layout.dataWidth}px`);
-        ui.style.setProperty('--fourier-width', `${layout.fourierWidth}px`);
-        ui.style.setProperty('--forecast-width', `${layout.forecastWidth}px`);
-        ui.style.setProperty('--wavelet-width', `${layout.waveletWidth}px`);
-        ui.style.setProperty('--scanner-width', `${layout.scannerWidth}px`);
-    };
-    applyLayout(savedLayout);
-    document.querySelectorAll('#layout-controls input[data-layout]').forEach(input => {
-        input.value = savedLayout[input.dataset.layout];
-        input.addEventListener('input', event => {
-            savedLayout[event.target.dataset.layout] = Number(event.target.value);
-            applyLayout(savedLayout);
-            localStorage.setItem('atr-plugin-layout', JSON.stringify(savedLayout));
-        });
-    });
+    ui.classList.add('mode-analysis');
+    document.getElementById('history-count').value = String([32, 64, 128].includes(visibleHistoryCount) ? visibleHistoryCount : 128);
+    document.getElementById('projection-count').value = String([5, 10, 20, 30, 40].includes(projectionBars) ? projectionBars : 20);
+    visibleHistoryCount = Number(document.getElementById('history-count').value);
+    projectionBars = Number(document.getElementById('projection-count').value);
+    document.getElementById('chart-price-mode').value = ['candles', 'close'].includes(chartPriceMode) ? chartPriceMode : 'candles';
+    document.getElementById('chart-trade-side').value = ['auto', 'long', 'short'].includes(chartTradeSide) ? chartTradeSide : 'auto';
+    chartPriceMode = document.getElementById('chart-price-mode').value;
+    chartTradeSide = document.getElementById('chart-trade-side').value;
+    document.getElementById('projection-legend-count').textContent = projectionBars;
+    ui.style.setProperty('--panel-width', '960px');
+    ui.style.setProperty('--panel-height', '760px');
+    const savedPluginSize = JSON.parse(localStorage.getItem('atr-plugin-size') || 'null');
+    if (savedPluginSize && Number.isFinite(savedPluginSize.width) && Number.isFinite(savedPluginSize.height)) {
+        ui.style.width = `${Math.min(window.innerWidth - 12, Math.max(440, savedPluginSize.width))}px`;
+        ui.style.height = `${Math.min(window.innerHeight - 45, Math.max(360, savedPluginSize.height))}px`;
+    }
     const savedPluginPosition = JSON.parse(localStorage.getItem('atr-plugin-position') || 'null');
     if (savedPluginPosition && Number.isFinite(savedPluginPosition.left) && Number.isFinite(savedPluginPosition.top)) {
         ui.style.left = `${Math.max(0, Math.min(savedPluginPosition.left, window.innerWidth - 60))}px`;
@@ -579,7 +529,7 @@
 
     const updateBreakEven = () => {
         const output = document.getElementById('breakeven-output');
-        if (!output || !lastMarketPrice || !window.EToroAnalytics) return;
+        if (!lastMarketPrice || !window.EToroAnalytics) return;
         const leverage = readNumber('lev-amount');
         const fee = window.EToroAnalytics.getEtoroFeeProfile(lastSymbol, leverage);
         const longEntry = lastAskPrice || lastMarketPrice;
@@ -587,7 +537,6 @@
         const common = {
             investment: readNumber('inv-amount'), leverage,
             openFeePercent: fee.openFeePercent,
-            closeFeePercent: fee.closeFeePercent,
             closeFeePercent: fee.closeFeePercent
         };
         const longResult = window.EToroAnalytics.calculateBreakEvenTP({ ...common, side: 'long', entryPrice: longEntry });
@@ -605,8 +554,12 @@
             priceLabel.textContent = 'Reference price';
         }
         const feeEl = document.getElementById('fee-profile');
-        feeEl.textContent = fee.label;
-        feeEl.classList.toggle('fee-warning', !fee.known);
+        if (feeEl) {
+            feeEl.textContent = fee.label;
+            feeEl.classList.toggle('fee-warning', !fee.known);
+        }
+
+        if (!output) return;
 
         if (!longResult.ok || !shortResult.ok) {
             output.textContent = longResult.error || shortResult.error;
@@ -624,59 +577,38 @@
     const updateTradePlan = () => {
         const output = document.getElementById('trade-plan-output');
         if (!output || !lastCombinedAnalysis || !(lastAtrValue > 0) || !lastMarketPrice) return;
-        const side = document.getElementById('trade-plan-side').value;
         const leverage = readNumber('lev-amount');
+        const investment = readNumber('inv-amount');
         const fee = window.EToroAnalytics.getEtoroFeeProfile(lastSymbol, leverage);
-        const entryPrice = side === 'long'
-            ? (lastAskPrice || lastMarketPrice)
-            : (lastBidPrice || lastMarketPrice);
-        const minimumZoneDistance = lastAtrValue * 1.50;
-        const supports = lastCombinedAnalysis.zones.supports
-            .filter(zone => entryPrice - zone.high > minimumZoneDistance)
-            .sort((a, b) => b.low - a.low);
-        const resistances = lastCombinedAnalysis.zones.resistances
-            .filter(zone => zone.low - entryPrice > minimumZoneDistance)
-            .sort((a, b) => a.high - b.high);
-        const result = window.EToroAnalytics.calculateBestZoneTradePlan({
-            side, entryPrice,
-            investment: readNumber('inv-amount'), leverage,
-            atr: lastAtrValue,
-            supports: supports.slice(0, 4),
-            resistances: resistances.slice(0, 4),
-            openFeePercent: fee.openFeePercent,
-            stopBufferAtr: 0.10,
-            recommendedAtrMultiple: 1.50,
-            openingCostMultiple: 2,
-            roundTripCostMultiple: 2
-        });
-        if (!result.ok) {
-            output.innerHTML = `<div class="plan-warning">${result.error}</div>`;
-            return;
-        }
-        const plan = result.best;
-        const decimals = priceDecimals(entryPrice);
-        const ticket = window.EToroAnalytics.calculateTicketRiskLevels({
-            side, entryPrice,
-            investment: readNumber('inv-amount'), leverage,
-            atr: lastAtrValue, atrMultiple: plan.recommendedAtrMultiple,
-            targetPrice: plan.technicalTarget, stopPrice: plan.technicalStop
-        });
-        const exposure = readNumber('inv-amount') * leverage;
-        const openingCost = exposure * Math.max(0, fee.openFeePercent) / 100;
-        const openingCostText = fee.known ? `$${openingCost.toFixed(2)}` : 'not verified';
-        const targetReference = plan.targetIndex ? ` · ${side === 'long' ? 'R' : 'S'}${plan.targetIndex}` : ' · fallback';
-        const stopReference = plan.stopIndex ? ` · ${side === 'long' ? 'S' : 'R'}${plan.stopIndex}` : ' · ATR';
-        const fallbackNotice = result.fallback
-            ? `<div class="plan-alert bad">⚠ ${result.reason} Fallback TP = ${plan.rewardRisk.toFixed(2)} × SL.</div>`
-            : `<div class="plan-alert ok">✓ ${result.validCount}/${result.totalCount} technical combinations; selected by R/R (70%) and joint Wavelet zone score (30%)</div>`;
-        output.innerHTML = `
-            <div class="plan-level entry"><span>1. Open ${side === 'long' ? 'LONG' : 'SHORT'} at</span><b>${entryPrice.toFixed(decimals)}</b><small>Investment $${readNumber('inv-amount').toFixed(2)} · exposure $${exposure.toFixed(2)} · opening cost ${openingCostText}</small></div>
-            <div class="plan-level target"><span>2. TP: close with profit${targetReference}</span><b>Price ${plan.technicalTarget.toFixed(decimals)}</b><small>Enter +$${ticket.targetAmount.toFixed(2)} in eToro · move ${plan.targetPercent.toFixed(2)}%</small></div>
-            <div class="plan-level stop"><span>3. SL: close with loss${stopReference}</span><b>Price ${plan.technicalStop.toFixed(decimals)}</b><small>Enter −$${ticket.stopAmount.toFixed(2)} in eToro · move ${plan.stopPercent.toFixed(2)}%</small></div>
-            <div class="plan-level minimum"><span>Volatility boundary</span><b>${ticket.atrMultiple.toFixed(2)} ATR = $${ticket.recommendedMoney.toFixed(2)}</b><small>1 ATR = ${lastAtrValue.toFixed(decimals)} / $${ticket.atrMoney.toFixed(2)} · SL must cross ${ticket.atrBoundaryPrice.toFixed(decimals)}</small></div>
-            <div class="plan-level minimum"><span>Reward/risk ratio</span><b>${plan.rewardRisk.toFixed(2)} to 1</b><small>Potential gain $${ticket.targetAmount.toFixed(2)} versus loss $${ticket.stopAmount.toFixed(2)}</small></div>
-            <div class="plan-alert ${ticket.stopOutsideAtr && fee.known ? 'ok' : 'bad'}">${ticket.stopOutsideAtr ? '✓ SL beyond recommended ATR' : '⚠ SL inside recommended ATR'} · TP &gt; SL · ${fee.known ? `profit > $${plan.minimumProfit.toFixed(2)}` : '⚠ verify the cost in eToro'}</div>
-            ${fallbackNotice}`;
+        const exposure = investment * leverage;
+        const roundTripCost = fee.known ? exposure * (fee.openFeePercent + fee.closeFeePercent) / 100 : null;
+        const renderSide = side => {
+            const entryPrice = side === 'long' ? (lastAskPrice || lastMarketPrice) : (lastBidPrice || lastMarketPrice);
+            const result = window.EToroAnalytics.calculateBestZoneTradePlan({
+                side, entryPrice, investment, leverage, atr: lastAtrValue,
+                supports: lastCombinedAnalysis.zones.supports,
+                resistances: lastCombinedAnalysis.zones.resistances,
+                openFeePercent: fee.openFeePercent, closeFeePercent: fee.closeFeePercent,
+                stopBufferAtr: 0.10, recommendedAtrMultiple: 1.50,
+                openingCostMultiple: 2, roundTripCostMultiple: 2
+            });
+            if (!result.ok) return `<section class="trade-side"><h4>${side.toUpperCase()}</h4><div class="plan-warning">${result.error}</div></section>`;
+            const plans = result.fallback ? [result.best] : result.combinations.filter(plan => plan.valid).slice(0, 4);
+            const decimals = priceDecimals(entryPrice);
+            const rows = plans.map((plan, index) => {
+                const margin = roundTripCost === null ? null : plan.potentialProfit - roundTripCost;
+                return `<div class="trade-combination">
+                    <b>#${index + 1}${plan.fallback ? ' · ATR fallback' : ''}</b>
+                    <span>Entry <strong>${entryPrice.toFixed(decimals)}</strong></span>
+                    <span>TP <strong>${plan.technicalTarget.toFixed(decimals)}</strong> · +$${plan.potentialProfit.toFixed(2)}</span>
+                    <span>SL <strong>${plan.technicalStop.toFixed(decimals)}</strong> · −$${plan.potentialLoss.toFixed(2)}</span>
+                    <span>R/R <strong>${plan.rewardRisk.toFixed(2)}</strong> · open + close ${roundTripCost === null ? 'verify' : `$${roundTripCost.toFixed(2)}`}</span>
+                    <span class="${margin !== null && margin > 0 ? 'margin-positive' : 'margin-negative'}">Profit margin <strong>${margin === null ? 'verify' : `${margin >= 0 ? '+' : '−'}$${Math.abs(margin).toFixed(2)}`}</strong></span>
+                </div>`;
+            }).join('');
+            return `<section class="trade-side"><h4>${side.toUpperCase()} · ${plans.length} usable combination${plans.length === 1 ? '' : 's'}</h4>${rows}</section>`;
+        };
+        output.innerHTML = renderSide('long') + renderSide('short');
     };
 
     const aggregateScannerCandles = (candles, groupSize = 1) => {
@@ -707,7 +639,7 @@
         const atr = calculateATR(candles, 14);
         if (!(atr > 0)) return { asset, timeframe, error: 'ATR unavailable' };
         const combined = window.EToroAnalytics.analyzeCombined(prices, atr, {
-            ...modelParams, harmonics: SCANNER_HARMONICS, horizon: 10
+            ...modelParams, harmonics: SCANNER_HARMONICS, horizon: 10, candles: sample
         });
         const current = prices.at(-1);
         const investment = Math.max(10, readNumber('inv-amount'));
@@ -731,12 +663,20 @@
         const roundTripCost = fee.known
             ? investment * (fee.openFeePercent + fee.closeFeePercent) / 100
             : null;
+        const openingCost = fee.known ? investment * fee.openFeePercent / 100 : 0;
         const alternatives = [
             { side: 'long', plan: longPlan }, { side: 'short', plan: shortPlan }
         ].map(item => {
+            const costExcursion = window.EToroAnalytics.analyzeCostAdjustedExcursion(prices, {
+                side: item.side, horizonBars: 10, lookback: 200,
+                investment, leverage: 1, openingCost,
+                roundTripCost: roundTripCost || 0,
+                requiredNetMultiple: 2, minimumHitRate: 0.55
+            });
             const decision = window.EToroAnalytics.evaluateEntryDecision({
                 side: item.side, projection, plan: item.plan, feeKnown: fee.known,
-                atr, atrMultiple: 1.50, roundTripCost, costMultiple: 2
+                atr, atrMultiple: 1.50, openingCost, roundTripCost,
+                requiredNetMultiple: 2, costExcursion
             });
             const passed = decision.checks.filter(check => check.pass).length;
             const plan = item.plan.ok ? item.plan.best : null;
@@ -748,9 +688,10 @@
                 feeKnown: fee.known,
                 atrPercentile: filters.ok ? filters.atrPercentile : 100,
                 confirmations: passed,
+                excursionHitRate: costExcursion.ok ? costExcursion.hitRate : 0,
                 fallback: Boolean(item.plan.fallback || plan?.fallback)
             });
-            return { ...item, decision, passed, ranking };
+            return { ...item, decision, passed, ranking, costExcursion };
         }).sort((a, b) => a.ranking.riskScore - b.ranking.riskScore
             || b.ranking.opportunityScore - a.ranking.opportunityScore
             || b.passed - a.passed);
@@ -773,8 +714,9 @@
             targetPercent: plan?.targetPercent, stopPercent: plan?.stopPercent,
             atrPercent: atr / current * 100,
             profit: profitUsd, loss: lossUsd, atrUsd,
-            openingCost: investment * fee.openFeePercent / 100,
+            openingCost,
             roundTripCost, netProfit, feeKnown: fee.known,
+            costExcursion: best.costExcursion,
             riskScore, riskLevel, opportunityScore,
             targetFallback: Boolean(best.plan.fallback || plan?.fallback || !plan?.targetIndex),
             investment, source: 'Yahoo Finance', harmonics: projection.harmonics,
@@ -803,8 +745,9 @@
                 <div class="scanner-prices"><span>Current <b>${result.current.toFixed(decimals)}</b></span><span>TP <b>${Number.isFinite(result.targetPrice) ? `${result.targetPrice.toFixed(decimals)} · ${result.targetPercent.toFixed(2)}%` : '--'}</b></span><span>SL <b>${Number.isFinite(result.stopPrice) ? `${result.stopPrice.toFixed(decimals)} · ${result.stopPercent.toFixed(2)}%` : '--'}</b></span></div>
                 <div class="scanner-money"><span>Gross TP <b>+$${Number.isFinite(result.profit) ? result.profit.toFixed(2) : '--'}</b></span><span>SL risk <b>−$${Number.isFinite(result.loss) ? result.loss.toFixed(2) : '--'}</b></span><span>R/R <b>${result.rewardRisk.toFixed(2)}</b></span></div>
                 <div class="scanner-money"><span>ATR <b>${result.atr.toFixed(decimals)} · ${result.atrPercent.toFixed(2)}%</b></span><span>ATR in $ <b>$${result.atrUsd.toFixed(2)}</b></span><span>Net TP <b>${result.netProfit === null ? 'verify' : `${result.netProfit >= 0 ? '+' : '−'}$${Math.abs(result.netProfit).toFixed(2)}`}</b></span></div>
+                <div class="scanner-money"><span>Net goal <b>$${result.costExcursion?.requiredNetProfit?.toFixed(2) || '--'}</b></span><span>Gross required <b>$${result.costExcursion?.requiredGrossProfit?.toFixed(2) || '--'}</b></span><span>Historical hit <b>${result.costExcursion?.ok ? `${(result.costExcursion.hitRate * 100).toFixed(0)}% · ${result.costExcursion.medianHitBars?.toFixed(1) || '--'} bars` : '--'}</b></span></div>
                 <div class="scanner-forecast"><span>Fourier <b>${result.harmonics} cycles</b></span><span>1 ATR <b>${formatHours(result.atrHours)}</b></span><span>TP <b>${formatHours(result.targetHours)}</b></span></div>
-                <small>${result.targetFallback ? 'Fallback TP ≥ 1.5 × SL (raised when costs require it)' : 'TP based on a Wavelet zone'} · position $${result.investment.toFixed(2)} X1 · round-trip cost ${result.roundTripCost === null ? 'not verified' : `$${result.roundTripCost.toFixed(2)}`} · risk ${(result.riskScore * 100).toFixed(0)}/100${failed ? ` · Missing: ${failed}` : ' · All checks present'}</small>
+                <small>${result.targetFallback ? 'Fallback TP ≥ 1.5 × SL (raised when costs require it)' : 'TP based on a Wavelet zone'} · median favorable excursion ${result.costExcursion?.ok ? `$${result.costExcursion.medianGrossProfit.toFixed(2)}` : '--'} · position $${result.investment.toFixed(2)} X1 · round-trip cost ${result.roundTripCost === null ? 'not verified' : `$${result.roundTripCost.toFixed(2)}`} · risk ${(result.riskScore * 100).toFixed(0)}/100${failed ? ` · Missing: ${failed}` : ' · All checks present'}</small>
             </article>`;
         }).join('');
     };
@@ -852,39 +795,67 @@
         const now = new Date();
         const fee = window.EToroAnalytics.getEtoroFeeProfile(lastSymbol, readNumber('lev-amount'));
         const payload = {
-            schema: 'etoro-atr-diagnostic-v1',
+            schema: 'etoro-chart-comparison-v2',
             generatedAt: now.toISOString(),
             extension: {
                 name: chrome.runtime.getManifest().name,
                 version: chrome.runtime.getManifest().version,
-                mode: document.getElementById('plugin-mode')?.value,
                 note: 'Technical file without name, email, total balance or account identifiers.'
             },
             instrument: {
                 symbol: lastSymbol,
                 timeframe: lastTimeframe,
+                pageUrl: window.location.href,
                 marketPrice: lastMarketPrice,
                 bid: lastBidPrice,
                 ask: lastAskPrice,
                 priceSource: lastPriceSource,
-                historyAlignedToEtoro
+                historyAlignedToEtoro,
+                historyScaleFactor,
+                historyPriceOffset,
+                observedEtoroCandles: candlesHistory.filter(candle => candle.source === 'etoro-observed').length,
+                historicalProxy: lastSymbol === 'GOLD' ? 'Yahoo GC=F adjusted by additive live basis' : 'Yahoo proxy adjusted by additive live basis'
+            },
+            chartConfiguration: {
+                visibleHistoricalCandles: visibleHistoryCount,
+                projectedCandles: projectionBars,
+                priceDisplay: chartPriceMode,
+                tradeSide: chartTradeSide,
+                fourierHarmonics: visibleCyclesCount,
+                waveletLevels: visibleWaveletLevels,
+                layers: {
+                    fourier: document.getElementById('show-fourier')?.checked,
+                    atr: document.getElementById('show-atr')?.checked,
+                    takeProfit: document.getElementById('show-tp')?.checked,
+                    stopLoss: document.getElementById('show-sl')?.checked
+                }
             },
             positionInputs: {
                 investmentUsd: readNumber('inv-amount'),
                 leverage: readNumber('lev-amount'),
-                selectedSide: document.getElementById('trade-plan-side')?.value,
+                selectedSide: chartTradeSide,
                 feeProfile: fee
             },
             latestIndicators: {
                 atr14: lastAtrValue,
                 combinedAnalysis: lastCombinedAnalysis,
                 marketFilters: lastMarketFilters,
-                fourierProjection10Bars: lastFutureProjection,
+                fourierProjection: lastFutureProjection,
                 entryDecision: lastEntryDecision,
                 tradePlans: lastTradePlans,
                 calibratedModelParameters: modelParams
             },
-            candles: candlesHistory.map(candle => ({
+            pluginCandlesAlignedToEtoro: candlesHistory.map(candle => ({
+                timestamp: candle.t,
+                isoTime: Number.isFinite(candle.t) ? new Date(candle.t * 1000).toISOString() : null,
+                open: candle.o ?? null,
+                high: candle.h,
+                low: candle.l,
+                close: candle.c,
+                volume: Number.isFinite(candle.v) ? candle.v : null,
+                source: candle.source || 'unknown'
+            })),
+            yahooCandlesOriginal: rawYahooCandles.map(candle => ({
                 timestamp: candle.t,
                 isoTime: Number.isFinite(candle.t) ? new Date(candle.t * 1000).toISOString() : null,
                 open: candle.o ?? null,
@@ -893,7 +864,7 @@
                 close: candle.c,
                 volume: Number.isFinite(candle.v) ? candle.v : null
             })),
-            liveCandle: liveCandle ? {
+            etoroObservedCandle: liveCandle ? {
                 timestamp: liveCandle.t,
                 isoTime: new Date(liveCandle.t * 1000).toISOString(),
                 open: liveCandle.o,
@@ -904,14 +875,30 @@
                 partial: true,
                 excludedFromIndicators: true
             } : null,
-            scanner: {
-                intervalMinutes: Number(document.getElementById('scanner-interval')?.value || 10),
-                harmonics: SCANNER_HARMONICS,
-                results: lastScannerResults
-            },
+            sourceComparison: (() => {
+                const yahooClose = rawYahooCandles.at(-1)?.c;
+                const alignedClose = candlesHistory.at(-1)?.c;
+                const latestAlignedProxy = [...candlesHistory].reverse().find(candle => candle.source !== 'etoro-observed');
+                const aggregatedYahooClose = Number.isFinite(latestAlignedProxy?.c)
+                    ? latestAlignedProxy.c - historyPriceOffset : null;
+                const etoroReference = lastBidPrice && lastAskPrice
+                    ? (lastBidPrice + lastAskPrice) / 2 : (lastMarketPrice || liveCandle?.c);
+                const compare = source => Number.isFinite(source) && Number.isFinite(etoroReference)
+                    ? { absolute: etoroReference - source, percent: (etoroReference / source - 1) * 100 } : null;
+                return {
+                    etoroReference,
+                    yahooLastRawQuote: yahooClose,
+                    yahooLastAggregatedCloseBeforeAlignment: aggregatedYahooClose,
+                    pluginAlignedLastClose: alignedClose,
+                    etoroMinusYahoo: compare(yahooClose),
+                    etoroMinusAggregatedYahoo: compare(aggregatedYahooClose),
+                    etoroMinusPluginAligned: compare(alignedClose),
+                    warning: 'eToro does not expose its complete chart series in the page DOM. Only the observed eToro candle and executable quotes can be exported; historical candles come from Yahoo Finance.'
+                };
+            })(),
             interpretationWarnings: [
                 'Yahoo quotes may differ from executable eToro prices.',
-                'The Fourier band is illustrative ±1σ dispersion, not a calibrated confidence interval.',
+                'The Fourier band uses the historical 90th-percentile validation error; it is empirical but is not a formal confidence interval.',
                 'Costs may exclude overnight financing, slippage, currency conversion and taxes.'
             ]
         };
@@ -937,28 +924,34 @@
         if (!quotes.bid && !quotes.ask) return false;
         const nextBid = quotes.bid || lastBidPrice;
         const nextAsk = quotes.ask || lastAskPrice;
-        if (nextBid === lastBidPrice && nextAsk === lastAskPrice) return false;
+        const quotesChanged = nextBid !== lastBidPrice || nextAsk !== lastAskPrice;
         lastBidPrice = nextBid;
         lastAskPrice = nextAsk;
         lastMarketPrice = lastBidPrice && lastAskPrice
             ? (lastBidPrice + lastAskPrice) / 2
             : (lastBidPrice || lastAskPrice);
         lastPriceSource = 'executable eToro prices';
+        let historyJustAligned = false;
         if (!historyAlignedToEtoro && candlesHistory.length) {
-            const historicalLast = candlesHistory[candlesHistory.length - 1].c;
-            const scale = lastMarketPrice / historicalLast;
-            if (Number.isFinite(scale) && scale > 0.5 && scale < 1.5) {
+            const latestProxy = [...candlesHistory].reverse().find(candle => candle.source !== 'etoro-observed');
+            const historicalLast = latestProxy?.c;
+            const offset = lastMarketPrice - historicalLast;
+            if (Number.isFinite(offset) && Math.abs(offset) < lastMarketPrice * 0.20) {
                 candlesHistory = candlesHistory.map(candle => ({
                     ...candle,
-                    o: Number.isFinite(candle.o) ? candle.o * scale : candle.o,
-                    h: Number.isFinite(candle.h) ? candle.h * scale : candle.h,
-                    l: Number.isFinite(candle.l) ? candle.l * scale : candle.l,
-                    c: candle.c * scale
+                    o: candle.source === 'etoro-observed' || !Number.isFinite(candle.o) ? candle.o : candle.o + offset,
+                    h: candle.source === 'etoro-observed' || !Number.isFinite(candle.h) ? candle.h : candle.h + offset,
+                    l: candle.source === 'etoro-observed' || !Number.isFinite(candle.l) ? candle.l : candle.l + offset,
+                    c: candle.source === 'etoro-observed' ? candle.c : candle.c + offset
                 }));
+                historyScaleFactor = 1;
+                historyPriceOffset = offset;
                 historyAlignedToEtoro = true;
+                historyJustAligned = true;
                 performCalculations(lastTimeframe, lastSymbol);
             }
         }
+        if (!quotesChanged && !historyJustAligned) return false;
         updateBreakEven();
         updateTradePlan();
         return true;
@@ -1013,7 +1006,7 @@
         const atr = calculateATR(closedCandles, 14);
         const combined = window.EToroAnalytics.analyzeCombined(prices.slice(-N), atr, {
             ...modelParams,
-            harmonics: Math.min(visibleCyclesCount, 5)
+            harmonics: visibleCyclesCount
         });
         if (!combined.active) {
             calibrateHistoricalModel(symbol, timeframe, prices);
@@ -1038,38 +1031,6 @@
             if (candlesHistory.length >= N) performCalculations(lastTimeframe, lastSymbol);
         });
     });
-    document.getElementById('trade-plan-side').addEventListener('change', event => {
-        localStorage.setItem('atr-plugin-trade-side', event.target.value);
-        updateTradePlan();
-        if (candlesHistory.length >= N) performCalculations(lastTimeframe, lastSymbol);
-    });
-    document.getElementById('scanner-refresh').addEventListener('click', runOpportunityScanner);
-    document.getElementById('scanner-interval').addEventListener('change', scheduleOpportunityScanner);
-    document.getElementById('download-diagnostic').addEventListener('click', downloadDiagnosticBundle);
-    document.getElementById('layout-toggle').addEventListener('click', () => {
-        const controls = document.getElementById('layout-controls');
-        controls.hidden = !controls.hidden;
-    });
-    document.getElementById('plugin-mode').addEventListener('change', event => {
-        const mode = event.target.value;
-        localStorage.setItem('atr-plugin-mode', mode);
-        ui.classList.toggle('mode-simple', mode === 'simple');
-        ui.classList.toggle('mode-analysis', mode === 'analysis');
-        document.getElementById('layout-controls').hidden = true;
-    });
-    const pluginGrid = document.querySelector('.plugin-grid');
-    const scrollColumns = direction => {
-        const visibleColumn = Math.max(260, pluginGrid.clientWidth * 0.72);
-        pluginGrid.scrollBy({ left: direction * visibleColumn, behavior: 'smooth' });
-    };
-    document.getElementById('columns-left').addEventListener('click', () => scrollColumns(-1));
-    document.getElementById('columns-right').addEventListener('click', () => scrollColumns(1));
-    pluginGrid.addEventListener('wheel', event => {
-        if (!event.shiftKey || Math.abs(event.deltaY) < Math.abs(event.deltaX)) return;
-        event.preventDefault();
-        pluginGrid.scrollLeft += event.deltaY;
-    }, { passive: false });
-
     /* ========================================================================
        6. RENDERING AND DRAWING
        ======================================================================== */
@@ -1092,6 +1053,43 @@
             ctx.fillRect(i * w, canvas.height - h, w - 1, h);
         });
     }
+
+    function originalPriceDraw(prices) {
+        const canvas = document.getElementById('original-price-canvas');
+        if (!canvas || !prices?.length) return;
+        const ctx = canvas.getContext('2d');
+        const min = Math.min(...prices);
+        const max = Math.max(...prices);
+        const range = max - min || 1;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#11151d';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = '#00e676';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        prices.forEach((price, index) => {
+            const x = index / Math.max(1, prices.length - 1) * canvas.width;
+            const y = canvas.height - (price - min) / range * canvas.height;
+            index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        });
+        ctx.stroke();
+    }
+
+    const fourierTurnBars = (component, sampleSize) => {
+        const valueAt = index => {
+            const angle = 2 * Math.PI * component.k * index / sampleSize;
+            return component.real * Math.cos(angle) - component.imag * Math.sin(angle);
+        };
+        const currentIndex = sampleSize - 1;
+        const initialDelta = valueAt(currentIndex + 1) - valueAt(currentIndex);
+        const initialSign = Math.sign(initialDelta);
+        const maximum = Math.max(2, Math.ceil(sampleSize / component.k));
+        for (let step = 2; step <= maximum; step++) {
+            const delta = valueAt(currentIndex + step) - valueAt(currentIndex + step - 1);
+            if (Math.sign(delta) && Math.sign(delta) !== initialSign) return step - 1;
+        }
+        return null;
+    };
 
     /**
      * Reconstructs the signal in the time domain.
@@ -1158,45 +1156,14 @@
     }
 
     function drawFourierForecast(result, atr, longTarget, shortTarget, minutesPerBar) {
-        const canvas = document.getElementById('fourier-forecast-canvas');
         const output = document.getElementById('fourier-forecast-output');
-        if (!canvas || !output || !result?.ok) return;
-        const ctx = canvas.getContext('2d');
-        const levels = [result.current + atr, result.current - atr];
-        if (Number.isFinite(longTarget)) levels.push(longTarget);
-        if (Number.isFinite(shortTarget)) levels.push(shortTarget);
-        const all = [...result.forecast, ...(result.lowerBand || []), ...(result.upperBand || []), ...levels];
-        const min = Math.min(...all);
-        const max = Math.max(...all);
-        const range = max - min || 1;
-        const x = index => index / Math.max(1, result.forecast.length - 1) * canvas.width;
-        const y = value => canvas.height - (value - min) / range * canvas.height;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#11151d';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        if (result.lowerBand?.length === result.forecast.length && result.upperBand?.length === result.forecast.length) {
-            ctx.beginPath();
-            result.upperBand.forEach((value, index) => index ? ctx.lineTo(x(index), y(value)) : ctx.moveTo(x(index), y(value)));
-            for (let index = result.lowerBand.length - 1; index >= 0; index--) ctx.lineTo(x(index), y(result.lowerBand[index]));
-            ctx.closePath();
-            ctx.fillStyle = 'rgba(79, 195, 247, 0.16)';
-            ctx.fill();
+        if (!output || !result?.ok) return;
+        const list = document.getElementById('fourier-price-list');
+        if (!result.enabled) {
+            output.innerHTML = `<b class="cycle-turning">FOURIER DISABLED</b><small>${result.disabledReason} · stability ${(result.stability?.score * 100 || 0).toFixed(0)}/100 · endpoint error ${(result.endpointErrorAtr || 0).toFixed(2)} ATR</small>`;
+            if (list) list.innerHTML = '';
+            return;
         }
-        const level = (value, color, label) => {
-            ctx.save();
-            ctx.strokeStyle = color;
-            ctx.setLineDash([3, 3]);
-            ctx.beginPath(); ctx.moveTo(0, y(value)); ctx.lineTo(canvas.width, y(value)); ctx.stroke();
-            ctx.fillStyle = color; ctx.font = '7px monospace'; ctx.fillText(label, 3, Math.max(7, y(value) - 2));
-            ctx.restore();
-        };
-        level(result.current + atr, '#ffd166', '+ATR');
-        level(result.current - atr, '#ffd166', '-ATR');
-        if (Number.isFinite(longTarget)) level(longTarget, '#55e8a2', 'Long TP');
-        if (Number.isFinite(shortTarget)) level(shortTarget, '#ff7d7d', 'Short TP');
-        ctx.strokeStyle = '#4fc3f7'; ctx.lineWidth = 1.6; ctx.beginPath();
-        result.forecast.forEach((value, index) => index ? ctx.lineTo(x(index), y(value)) : ctx.moveTo(x(index), y(value)));
-        ctx.stroke();
         const duration = bars => {
             const totalMinutes = bars * minutesPerBar;
             return totalMinutes < 60 ? `${totalMinutes} min` : `${(totalMinutes / 60).toFixed(totalMinutes % 60 ? 1 : 0)} h`;
@@ -1213,10 +1180,9 @@
             status = '<b class="cycle-turning">UNCONFIRMED: does not exceed 1 ATR</b>';
         }
         const cycles = result.cycleDirections.map(item => `K${item.k}`).join(', ');
-        output.innerHTML = `${status}<small>${result.harmonics} cycles: ${cycles} · widening ±1σ volatility band · alignment ${(result.alignment * 100).toFixed(0)}/100${result.ambiguous ? ' · ⚠ both directions reach TP' : ''}</small>`;
-        const list = document.getElementById('fourier-price-list');
+        output.innerHTML = `${status}<small>${result.harmonics}/${result.requestedHarmonics} predictive cycles · adaptive ${result.adaptiveWindow}-candle window · empirical 90% error band (observed coverage ${(result.empiricalCoverage * 100).toFixed(0)}%) · stability ${(result.stability.score * 100).toFixed(0)}/100 · alignment ${(result.alignment * 100).toFixed(0)}/100${result.ambiguous ? ' · ⚠ both directions reach TP' : ''}</small>`;
         const decimals = priceDecimals(result.current);
-        list.innerHTML = result.forecast.slice(1, 11).map((value, index) =>
+        list.innerHTML = result.forecast.slice(1, result.horizonBars + 1).map((value, index) =>
             `<span><i>+${index + 1}</i><b>${value.toFixed(decimals)}</b><small>${result.lowerBand[index + 1].toFixed(decimals)}–${result.upperBand[index + 1].toFixed(decimals)}</small></span>`
         ).join('');
     }
@@ -1257,6 +1223,154 @@
             .join(' · ');
     }
 
+    function drawUnifiedAnalysis(prices, projection, overlays = {}, candles = []) {
+        const canvas = document.getElementById('unified-analysis-canvas');
+        if (!canvas || !projection?.ok) return;
+        const box = canvas.getBoundingClientRect();
+        const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        const targetWidth = Math.max(320, Math.round(box.width * pixelRatio));
+        const targetHeight = Math.max(160, Math.round(box.height * pixelRatio));
+        if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+            canvas.width = targetWidth;
+            canvas.height = targetHeight;
+        }
+        const ctx = canvas.getContext('2d');
+        const analysisCount = prices.length;
+        let fourierCycles = projection.cycleHistory || [];
+        let anchoredFourier = projection.fittedHistory || [];
+        let cumulativeHistories = (projection.displayCumulativeHistories || projection.cumulativeHistories || []).map(series => [...series]);
+        const wavelet = window.EToroAnalytics.haarWaveletAnalysis(prices, visibleWaveletLevels);
+        let waveletValues = wavelet.ok ? wavelet.reconstruction : prices;
+        const historyStart = Math.max(0, analysisCount - visibleHistoryCount);
+        prices = prices.slice(historyStart);
+        candles = candles.slice(historyStart);
+        const fourierVisibleCount = Math.min(visibleHistoryCount, fourierCycles.length);
+        fourierCycles = fourierCycles.slice(-fourierVisibleCount);
+        anchoredFourier = anchoredFourier.slice(-fourierVisibleCount);
+        cumulativeHistories = cumulativeHistories.map(series => series.slice(-fourierVisibleCount));
+        waveletValues = waveletValues.slice(historyStart);
+        const count = prices.length;
+        const showFourier = document.getElementById('show-fourier')?.checked !== false;
+        const future = projection.forecast.slice(1);
+        const lower = projection.lowerBand.slice(1);
+        const upper = projection.upperBand.slice(1);
+        const overlayValues = [overlays.atrLevel, overlays.tp, overlays.sl, overlays.executionPrice].filter(Number.isFinite);
+        const candleExtremes = chartPriceMode === 'candles'
+            ? candles.flatMap(candle => [candle.l, candle.h]).filter(Number.isFinite) : [];
+        const bandValues = projection.enabled ? [...lower, ...upper] : [];
+        const cumulativeValues = cumulativeHistories.flat();
+        const allValues = [...prices, ...candleExtremes, ...fourierCycles, ...anchoredFourier, ...cumulativeValues, ...waveletValues, ...future, ...bandValues, ...overlayValues];
+        const min = Math.min(...allValues);
+        const max = Math.max(...allValues);
+        const padding = (max - min || 1) * 0.05;
+        const low = min - padding;
+        const range = max - min + padding * 2 || 1;
+        const totalPoints = count + future.length;
+        const x = index => index / Math.max(1, totalPoints - 1) * canvas.width;
+        const y = value => canvas.height - (value - low) / range * canvas.height;
+        const drawLine = (values, startIndex, color, width, dash = []) => {
+            ctx.save();
+            ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash);
+            ctx.beginPath();
+            values.forEach((value, index) => index ? ctx.lineTo(x(startIndex + index), y(value)) : ctx.moveTo(x(startIndex), y(value)));
+            ctx.stroke(); ctx.restore();
+        };
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#11151d'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = 'rgba(255,255,255,.06)'; ctx.lineWidth = 1;
+        for (let row = 1; row < 5; row++) {
+            ctx.beginPath(); ctx.moveTo(0, canvas.height * row / 5); ctx.lineTo(canvas.width, canvas.height * row / 5); ctx.stroke();
+        }
+        if (showFourier && projection.enabled) {
+            ctx.beginPath();
+            ctx.moveTo(x(count - 1), y(projection.upperBand[0]));
+            upper.forEach((value, index) => ctx.lineTo(x(count + index), y(value)));
+            for (let index = lower.length - 1; index >= 0; index--) ctx.lineTo(x(count + index), y(lower[index]));
+            ctx.lineTo(x(count - 1), y(projection.lowerBand[0]));
+            ctx.closePath(); ctx.fillStyle = projection.enabled ? 'rgba(233, 103, 255, .16)' : 'rgba(150, 158, 170, .10)'; ctx.fill();
+        }
+        if (showFourier) {
+            const fourierStart = Math.max(0, count - fourierCycles.length);
+            drawLine(fourierCycles, fourierStart, projection.enabled ? '#4fc3f7' : '#64758a', 1.1, projection.enabled ? [] : [4, 3]);
+            const cumulativeColors = ['#38bdf8', '#60a5fa', '#818cf8', '#a78bfa', '#c084fc', '#e879f9', '#f472b6', '#fb7185'];
+            cumulativeHistories.forEach((series, index) => {
+                const retained = projection.displayCycleDirections?.[index]?.retained !== false;
+                drawLine(series, fourierStart, retained ? cumulativeColors[index % cumulativeColors.length] : '#596474',
+                    retained ? 0.85 : 0.65, retained ? [2 + index % 3, 3] : [1, 5]);
+            });
+            drawLine(anchoredFourier, fourierStart, projection.enabled ? '#ff5252' : '#8a7580', 1.7, projection.enabled ? [] : [4, 3]);
+        }
+        drawLine(waveletValues, 0, '#ffb74d', 1.3);
+        if (chartPriceMode === 'candles' && candles.length === prices.length) {
+            const candleWidth = Math.max(2, Math.min(10, canvas.width / Math.max(1, totalPoints) * 0.62));
+            candles.forEach((candle, index) => {
+                const open = Number(candle.o), high = Number(candle.h), lowPrice = Number(candle.l), close = Number(candle.c);
+                if (![open, high, lowPrice, close].every(Number.isFinite)) return;
+                const candleX = x(index);
+                const rising = close >= open;
+                ctx.strokeStyle = rising ? '#00e676' : '#ff5252';
+                ctx.fillStyle = rising ? '#00c98b' : '#e94f5f';
+                ctx.lineWidth = 1;
+                ctx.beginPath(); ctx.moveTo(candleX, y(high)); ctx.lineTo(candleX, y(lowPrice)); ctx.stroke();
+                const top = Math.min(y(open), y(close));
+                const bodyHeight = Math.max(1.5, Math.abs(y(close) - y(open)));
+                ctx.fillRect(candleX - candleWidth / 2, top, candleWidth, bodyHeight);
+            });
+        } else {
+            drawLine(prices, 0, '#00e676', 1.8);
+        }
+        if (showFourier) {
+            const cumulativeColors = ['#38bdf8', '#60a5fa', '#818cf8', '#a78bfa', '#c084fc', '#e879f9', '#f472b6', '#fb7185'];
+            (projection.displayCumulativeForecasts || projection.cumulativeForecasts || []).forEach((series, index) => {
+                const retained = projection.displayCycleDirections?.[index]?.retained !== false;
+                drawLine(series, count - 1, retained ? cumulativeColors[index % cumulativeColors.length] : '#596474',
+                    retained ? 0.85 : 0.65, retained ? [2, 4] : [1, 5]);
+            });
+            drawLine(projection.forecast, count - 1, projection.enabled ? '#e967ff' : '#8f98a6', 2, projection.enabled ? [5, 3] : [2, 5]);
+        }
+        const drawLevel = (value, color, label, dash) => {
+            if (!Number.isFinite(value)) return;
+            const levelY = y(value);
+            ctx.save();
+            ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.setLineDash(dash);
+            ctx.beginPath(); ctx.moveTo(0, levelY); ctx.lineTo(canvas.width, levelY); ctx.stroke();
+            ctx.setLineDash([]); ctx.font = 'bold 10px monospace';
+            const text = `${label} ${value.toFixed(priceDecimals(value))}`;
+            const width = ctx.measureText(text).width + 8;
+            ctx.fillStyle = 'rgba(17,21,29,.86)'; ctx.fillRect(canvas.width - width - 3, Math.max(1, levelY - 12), width, 13);
+            ctx.fillStyle = color; ctx.fillText(text, canvas.width - width + 1, Math.max(11, levelY - 2));
+            ctx.restore();
+        };
+        if (document.getElementById('show-atr')?.checked !== false) drawLevel(overlays.atrLevel, '#ffd166', `${overlays.sideLabel || ''} 1 ATR`, [7, 4]);
+        if (document.getElementById('show-tp')?.checked !== false) drawLevel(overlays.tp, '#55e8a2', 'TP', [3, 3]);
+        if (document.getElementById('show-sl')?.checked !== false) drawLevel(overlays.sl, '#ff7d7d', 'SL', [3, 3]);
+        drawLevel(overlays.executionPrice, '#dbeafe', `eToro ${overlays.executionLabel || 'PRICE'}`, [2, 4]);
+        ctx.fillStyle = '#9aa6b5'; ctx.font = '10px monospace';
+        ctx.fillText(max.toFixed(priceDecimals(max)), 4, 12);
+        ctx.fillText(min.toFixed(priceDecimals(min)), 4, canvas.height - 5);
+        ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(x(count - 1), 0); ctx.lineTo(x(count - 1), canvas.height); ctx.stroke(); ctx.setLineDash([]);
+        if (!projection.enabled && showFourier) {
+            ctx.fillStyle = 'rgba(17,21,29,.88)'; ctx.fillRect(Math.max(4, canvas.width - 245), 6, 239, 34);
+            ctx.fillStyle = '#ffd166'; ctx.font = 'bold 11px monospace';
+            ctx.fillText('UNSTABLE FOURIER — DIAGNOSTIC ONLY', Math.max(8, canvas.width - 241), 19);
+            ctx.fillStyle = '#9aa6b5'; ctx.font = '9px monospace';
+            ctx.fillText(`endpoint ${projection.endpointErrorAtr.toFixed(2)} ATR · stability ${(projection.stability.score * 100).toFixed(0)}/100`, Math.max(8, canvas.width - 241), 33);
+        }
+        if (wavelet.ok) {
+            const zones = overlays.waveletZones;
+            const supports = zones?.supports?.length || 0;
+            const resistances = zones?.resistances?.length || 0;
+            const pivots = zones?.pivots?.length || 0;
+            const explanation = pivots
+                ? `${pivots} OHLC-confirmed pivots produced ${supports} support and ${resistances} resistance zones.`
+                : 'No reconstructed plateau was confirmed as a repeated OHLC pivot; TP/SL therefore uses the ATR fallback.';
+            document.getElementById('wavelet-components').innerHTML = `<b>Wavelet regime: ${(zones?.regime || 'unknown').replaceAll('_', ' ').toUpperCase()}</b><br>`
+                + `Selected scales: ${wavelet.selected.map(component => `${component.scale} candles`).join(', ')}.<br>${explanation}`
+                + (zones?.settings ? `<br>Contacts ≥ ${zones.settings.minContactSeparation} candles apart · confirmation ${zones.settings.confirmationBars} candles · decay half-life ${zones.settings.decayHalfLife} candles.` : '');
+        }
+    }
+
     /* ========================================================================
        7. MONITOR PRINCIPAL (LOOP)
        ======================================================================== */
@@ -1273,7 +1387,8 @@
                 : phase.direction === 'down'
                     ? { label: 'BEARISH', arrow: '▼', css: 'cycle-down' }
                     : { label: 'TURNING/RANGE', arrow: '◆', css: 'cycle-turning' };
-            return `<div class="fourier-cycle-row"><span style="color:${color}">${label}</span><b>${p.toFixed(1)} candles</b><strong class="${direction.css}" title="Estimated phase direction for the next candle">${direction.arrow} ${direction.label}</strong></div>`;
+            const turnBars = fourierTurnBars(item, N_val);
+            return `<div class="fourier-cycle-row"><span style="color:${color}">${label}</span><b>${p.toFixed(1)}-candle period</b><strong class="${direction.css}" title="Estimated phase direction for the next candle">${direction.arrow} ${direction.label}</strong><small>nearest turn: ${turnBars === null ? '--' : `${turnBars} candle${turnBars === 1 ? '' : 's'}`}</small></div>`;
         }).join('');
     };
 
@@ -1306,41 +1421,14 @@
         try {    
             const sample     = candlesHistory.slice(-N); 
             const prices     = sample.map(v => v.c);
-            const timeframeMinutes = (() => {
-                const normalized = String(timeframe).toLowerCase();
-                const amount = parseFloat(normalized) || 1;
-                if (normalized.includes('d')) return amount * 1440;
-                if (normalized.includes('w')) return amount * 10080;
-                if (normalized.includes('h')) return amount * 60;
-                return amount;
-            })();
-            // Fourier works on log price: percentage changes become additive,
-            // and cycles no longer depend on the asset's nominal scale.
-            const cleanData  = fourierDetrend(prices.map(Math.log));
-            const spectrum   = fourierTransform(cleanData);
-            const currentIdx = N - 1;
-
-            // Magnitudes and dominant cycle.
-            const magnitudes = [];
-            for (let k = 1; k < N / 2; k++) {
-                magnitudes.push({
-                    k,
-                    mag: Math.sqrt(spectrum[k].real ** 2 + spectrum[k].imag ** 2),
-                    real: spectrum[k].real,
-                    imag: spectrum[k].imag
-                });
-            }
-
-            const topVisible = [...magnitudes].sort((a, b) => b.mag - a.mag).slice(0, visibleCyclesCount);
-            const domK = topVisible[0].k; 
-            const domP = N / domK;
-            const meanPrice = prices.reduce((a, b) => a + b) / N;
+            const timeframeMinutes = timeframeToMinutes(timeframe);
             const atrValue = calculateATR(candlesHistory, 14);
             const combined = window.EToroAnalytics.analyzeCombined(prices, atrValue, {
                 ...modelParams,
                 minMoveAtr: modelParams.minMoveAtr,
-                harmonics: Math.min(visibleCyclesCount, 5),
-                horizon: 10
+                harmonics: visibleCyclesCount,
+                horizon: 10,
+                candles: sample
             });
             lastCombinedAnalysis = combined;
             lastAtrValue = atrValue;
@@ -1354,7 +1442,7 @@
             const turnMinutes = candidate ? candidate.bars * timeframeMinutes : null;
             const turnDuration = turnMinutes === null ? '' : turnMinutes < 60
                 ? `${turnMinutes} min` : timeframeMinutes >= 1440
-                    ? `~${candidate.bars} sesiones` : `${(turnMinutes / 60).toFixed(turnMinutes % 60 ? 1 : 0)} h`;
+                    ? `~${candidate.bars} sessions` : `${(turnMinutes / 60).toFixed(turnMinutes % 60 ? 1 : 0)} h`;
             const projectionText = candidate
                 ? `${candidate.direction === 'bullish' ? '▲ BULLISH' : '▼ BEARISH'} · ${candidate.bars} candles · ${turnDuration}`
                 : 'NO CANDIDATE';
@@ -1405,27 +1493,17 @@
                 const dollarImpact = exposureUnits * priceDistance;
                 return `<option>${prefix}${index + 1} · price ${zone.low.toFixed(decimals)}–${zone.high.toFixed(decimals)} · impact $${dollarImpact.toFixed(2)} · zone ${(zone.strength * 100).toFixed(0)}/100</option>`;
             };
-            document.getElementById('wavelet-supports').innerHTML = sortedSupports.length
-                ? sortedSupports.slice(0, 4).map((zone, index) => zoneOption(zone, index, 'S')).join('') : '<option>No support beyond 1.50 ATR</option>';
-            document.getElementById('wavelet-resistances').innerHTML = sortedResistances.length
-                ? sortedResistances.slice(0, 4).map((zone, index) => zoneOption(zone, index, 'R')).join('') : '<option>No resistance beyond 1.50 ATR</option>';
             const atrDecimals = priceDecimals(currentPrice);
             document.getElementById('current-atr-distance').innerText = `${atrValue.toFixed(atrDecimals)} · ${(atrValue / currentPrice * 100).toFixed(2)}%`;
-            document.getElementById('recommended-atr').innerText = `1,50 ATR = ${recommendedAtrDistance.toFixed(atrDecimals)} · $${(exposureUnits * recommendedAtrDistance).toFixed(2)}`;
-            document.getElementById('combined-score').innerText = `${(combined.score * 100).toFixed(0)}/100 · alignment ${(combined.alignment * 100).toFixed(0)}/100`;
+            document.getElementById('recommended-atr').innerText = `1.50 ATR = ${recommendedAtrDistance.toFixed(atrDecimals)} · $${(exposureUnits * recommendedAtrDistance).toFixed(2)}`;
             
             // Update the remaining data.
             document.getElementById('f-samples').innerText = candlesHistory.length;
             document.getElementById('f-tf').innerText      = timeframe.toUpperCase();
-            document.getElementById('fourier-cycle').innerText = `Dominant cycle: ${domP.toFixed(1)} bars`;
-            document.getElementById('fourier-top-list').innerHTML = renderListWithHistory(topVisible, '#4fc3f7', true, N, currentIdx, prices[N-1], prices.reduce((a,b)=>a+b)/N);
             
             const valAtrEl = document.getElementById('val-atr');
             if (valAtrEl) valAtrEl.innerText = atrValue.toFixed((currentSymbol === 'SILVER' || currentSymbol === 'XAGUSD') ? 4 : 2);
             
-            fourierDraw(magnitudes.map(m => m.mag), domK - 1);
-            reconstructionDraw(spectrum, topVisible, N, sample);
-            waveletDraw(prices);
             const leverage = readNumber('lev-amount');
             const investment = readNumber('inv-amount');
             const fee = window.EToroAnalytics.getEtoroFeeProfile(lastSymbol, leverage);
@@ -1448,36 +1526,116 @@
             const shortTarget = shortPlan.ok ? shortPlan.best.technicalTarget : -Infinity;
             const futureProjection = window.EToroAnalytics.projectFourierToTargets(prices, atrValue, {
                 harmonics: visibleCyclesCount,
-                horizonBars: 10,
+                horizonBars: projectionBars,
+                minPeriodBars: 10,
                 longTarget,
                 shortTarget
             });
+            const latestClosedAt = sample.at(-1)?.t + timeframeMinutes * 60;
+            const dataAgeSeconds = Number.isFinite(latestClosedAt) ? Math.max(0, Date.now() / 1000 - latestClosedAt) : Infinity;
+            const dataAgeBars = dataAgeSeconds / Math.max(60, timeframeMinutes * 60);
+            const dataFresh = dataAgeBars <= 1.5;
+            futureProjection.modelEnabled = futureProjection.enabled;
+            futureProjection.dataFresh = dataFresh;
+            futureProjection.dataAgeBars = dataAgeBars;
+            if (!dataFresh) {
+                const staleReason = `historical series is ${dataAgeBars.toFixed(1)} candles stale (maximum 1.5)`;
+                futureProjection.enabled = false;
+                futureProjection.rejectionReasons = [staleReason, ...(futureProjection.rejectionReasons || [])];
+                futureProjection.disabledReason = futureProjection.rejectionReasons.join('; ');
+            }
+            const priceSign = currentStatusText === 'BULLISH' ? 1 : currentStatusText === 'BEARISH' ? -1 : 0;
+            const fourierUsable = futureProjection.enabled && dataFresh;
+            const fourierDelta = fourierUsable
+                ? futureProjection.forecast.at(-1) - futureProjection.current : 0;
+            const fourierSign = Math.abs(fourierDelta) >= atrValue * 0.25 ? Math.sign(fourierDelta) : 0;
+            const waveletRegime = combined.zones.regime || 'range';
+            const waveletSign = ['trending_up', 'bullish_breakout'].includes(waveletRegime) ? 1
+                : ['trending_down', 'bearish_breakout'].includes(waveletRegime) ? -1 : 0;
+            const votes = [priceSign, fourierSign, waveletSign].filter(Boolean);
+            const bullishVotes = votes.filter(value => value > 0).length;
+            const bearishVotes = votes.filter(value => value < 0).length;
+            const consensusSign = dataFresh ? (bullishVotes >= 2 ? 1 : bearishVotes >= 2 ? -1 : 0) : 0;
+            const conflict = new Set(votes).size > 1;
+            const zonesForEvidence = [...combined.zones.supports, ...combined.zones.resistances];
+            const waveletEvents = zonesForEvidence.reduce((sum, zone) => sum + zone.bounces + zone.breaks, 0);
+            const waveletBounceRate = waveletEvents
+                ? zonesForEvidence.reduce((sum, zone) => sum + zone.bounces, 0) / waveletEvents : 0;
+            const agreement = votes.length ? Math.max(bullishVotes, bearishVotes) / 3 : 0;
+            const empiricalConfidence = dataFresh ? Math.max(0, Math.min(1,
+                (futureProjection.enabled ? futureProjection.validationDirectionAccuracy * 0.65 : 0)
+                + waveletBounceRate * 0.20 + agreement * 0.15)) : 0;
+            const setSignal = (id, text, color) => {
+                const element = document.getElementById(id); element.textContent = text; element.style.color = color;
+            };
+            setSignal('signal-price-trend', dataFresh ? currentStatusText : `${currentStatusText} · STALE`, dataFresh ? currentStatusColor : '#ff7d7d');
+            setSignal('signal-fourier-direction', !dataFresh ? 'STALE DATA' : !futureProjection.enabled ? 'DISABLED'
+                : fourierSign > 0 ? 'BULLISH' : fourierSign < 0 ? 'BEARISH' : 'RANGE',
+                !dataFresh ? '#ff7d7d' : !futureProjection.enabled ? '#ffd166' : fourierSign > 0 ? '#55e8a2' : fourierSign < 0 ? '#ff7d7d' : '#ffd166');
+            setSignal('signal-wavelet-regime', waveletRegime.replaceAll('_', ' ').toUpperCase(),
+                waveletSign > 0 ? '#55e8a2' : waveletSign < 0 ? '#ff7d7d' : '#ffd166');
+            setSignal('signal-consensus', consensusSign > 0 ? 'BULLISH' : consensusSign < 0 ? 'BEARISH' : 'NO SIGNAL',
+                consensusSign > 0 ? '#55e8a2' : consensusSign < 0 ? '#ff7d7d' : '#ffd166');
+            setSignal('signal-conflict', conflict ? 'YES' : 'NO', conflict ? '#ff7d7d' : '#55e8a2');
+            setSignal('signal-confidence', `${(empiricalConfidence * 100).toFixed(0)}/100`,
+                empiricalConfidence >= 0.65 ? '#55e8a2' : empiricalConfidence >= 0.45 ? '#ffd166' : '#ff7d7d');
+            document.getElementById('signal-confidence').title = 'Empirical diagnostic score from Fourier holdout accuracy, Wavelet bounce history and method agreement; not a probability.';
+            document.getElementById('fourier-cycle').innerText = !dataFresh
+                ? `Diagnostic only · historical series is ${dataAgeBars.toFixed(1)} candles stale`
+                : futureProjection.enabled
+                ? `Adaptive ${futureProjection.adaptiveWindow} candles · requested ${futureProjection.requestedHarmonics}, retained ${futureProjection.harmonics} · stability ${(futureProjection.stability.score * 100).toFixed(0)}/100`
+                : `Fourier diagnostic only · requested ${futureProjection.requestedHarmonics}, retained ${futureProjection.harmonics}`;
+            document.getElementById('fourier-top-list').innerHTML = (futureProjection.displayCycleDirections || futureProjection.cycleDirections).map((cycle, index) =>
+                `<div class="fourier-cycle-row ${cycle.retained === false ? 'cycle-excluded' : ''}"><div class="fourier-cycle-head"><span>C${index + 1} · f=${cycle.k.toFixed(2)}</span><b>${cycle.period.toFixed(1)}-candle cycle</b><strong class="${cycle.direction === 'up' ? 'cycle-up' : cycle.direction === 'down' ? 'cycle-down' : 'cycle-turning'}">${cycle.direction.toUpperCase()}</strong></div><div class="fourier-cycle-state">${cycle.retained === false ? 'DIAGNOSTIC ONLY · EXCLUDED FROM SIGNAL' : 'RETAINED BY VALIDATION'}</div><div class="fourier-cycle-metrics"><span>Amplitude <b>≈ ${(currentPrice * cycle.amplitude).toFixed(priceDecimals(currentPrice))}</b></span><span>Next contribution <b>${currentPrice * cycle.delta >= 0 ? '+' : ''}${(currentPrice * cycle.delta).toFixed(priceDecimals(currentPrice))}</b></span></div></div>`
+            ).join('');
+
+            const etoroReference = lastBidPrice && lastAskPrice ? (lastBidPrice + lastAskPrice) / 2 : lastMarketPrice;
+            const rawYahoo = rawYahooCandles.at(-1)?.c;
+            const alignedDifference = Number.isFinite(etoroReference) ? currentPrice - etoroReference : null;
+            const rawDifference = Number.isFinite(etoroReference) && Number.isFinite(rawYahoo) ? rawYahoo - etoroReference : null;
+            const spread = lastBidPrice && lastAskPrice ? lastAskPrice - lastBidPrice : null;
+            const fit = futureProjection.fitDiagnostics;
+            const discrepancyClass = valueAtr => valueAtr > 1 ? 'discrepancy-bad' : valueAtr > 0.5 ? 'discrepancy-warning' : '';
+            const discrepancyOutput = document.getElementById('discrepancy-output');
+            discrepancyOutput.innerHTML = `
+                <span class="${discrepancyClass(Math.abs(alignedDifference || 0) / atrValue)}">Aligned close − eToro mid <b>${Number.isFinite(alignedDifference) ? `${alignedDifference >= 0 ? '+' : ''}${alignedDifference.toFixed(priceDecimals(currentPrice))} (${(alignedDifference / atrValue).toFixed(2)} ATR)` : 'unavailable'}</b></span>
+                <span class="${discrepancyClass(Math.abs(rawDifference || 0) / atrValue)}">Raw Yahoo − eToro mid <b>${Number.isFinite(rawDifference) ? `${rawDifference >= 0 ? '+' : ''}${rawDifference.toFixed(priceDecimals(currentPrice))}` : 'unavailable'}</b></span>
+                <span class="${discrepancyClass((spread || 0) / atrValue)}">Executable spread <b>${Number.isFinite(spread) ? `${spread.toFixed(priceDecimals(currentPrice))} (${(spread / atrValue).toFixed(2)} ATR)` : 'unavailable'}</b></span>
+                <span class="${discrepancyClass(fit.rmseAtr)}">Fourier historical RMSE <b>${fit.rmse.toFixed(priceDecimals(currentPrice))} (${fit.rmseAtr.toFixed(2)} ATR)</b></span>
+                <span class="${discrepancyClass(futureProjection.endpointErrorAtr)}">Fourier endpoint error <b>${futureProjection.endpointError >= 0 ? '+' : ''}${futureProjection.endpointError.toFixed(priceDecimals(currentPrice))} (${futureProjection.endpointErrorAtr.toFixed(2)} ATR)</b></span>
+                <span class="${futureProjection.validationDirectionAccuracy < 0.5 ? 'discrepancy-bad' : futureProjection.validationDirectionAccuracy < 0.6 ? 'discrepancy-warning' : ''}">Validation direction <b>${(futureProjection.validationDirectionAccuracy * 100).toFixed(1)}%</b></span>
+                <span>Historical source <b>${candlesHistory.filter(candle => candle.source === 'etoro-observed').length} eToro / ${candlesHistory.length} candles</b></span>
+                <span class="${dataFresh ? '' : 'discrepancy-bad'}">Last closed-candle age <b>${dataAgeBars.toFixed(1)} candles · ${(dataAgeSeconds / 60).toFixed(0)} min</b></span>
+                <span>Adaptive model <b>${futureProjection.adaptiveWindow} candles · ${futureProjection.harmonics} harmonics</b></span>
+                <span class="${futureProjection.enabled && dataFresh ? '' : 'discrepancy-bad'}">Projection status <b>${futureProjection.enabled && dataFresh ? 'VALIDATED FOR DISPLAY' : !dataFresh ? 'REJECTED · STALE SERIES' : 'REJECTED · DIAGNOSTIC ONLY'}</b></span>`;
+            const automaticSide = consensusSign > 0 ? 'long' : consensusSign < 0 ? 'short' : null;
+            const suggestedSide = chartTradeSide === 'auto' ? automaticSide : chartTradeSide;
+            const suggestedPlan = suggestedSide === 'long' ? longPlan : suggestedSide === 'short' ? shortPlan : null;
+            const suggestedEntry = suggestedSide === 'long'
+                ? (lastAskPrice || currentPrice) : suggestedSide === 'short' ? (lastBidPrice || currentPrice) : currentPrice;
+            drawUnifiedAnalysis(prices, futureProjection, {
+                sideLabel: suggestedSide?.toUpperCase(),
+                atrLevel: suggestedSide === 'long' ? suggestedEntry + atrValue
+                    : suggestedSide === 'short' ? suggestedEntry - atrValue : null,
+                tp: suggestedPlan?.ok ? suggestedPlan.best.technicalTarget : null,
+                sl: suggestedPlan?.ok ? suggestedPlan.best.technicalStop : null,
+                waveletZones: combined.zones,
+                executionPrice: suggestedSide === 'long' ? (lastAskPrice || lastMarketPrice)
+                    : suggestedSide === 'short' ? (lastBidPrice || lastMarketPrice) : lastMarketPrice,
+                executionLabel: suggestedSide === 'long' ? 'ASK' : suggestedSide === 'short' ? 'BID' : 'MID'
+            }, sample);
             drawFourierForecast(futureProjection, atrValue, longTarget, shortTarget, timeframeMinutes);
             const filters = window.EToroAnalytics.analyzeMarketFilters(candlesHistory.slice(-200));
-            const selectedSide = document.getElementById('trade-plan-side')?.value || 'long';
-            const selectedPlan = selectedSide === 'long' ? longPlan : shortPlan;
-            const decision = window.EToroAnalytics.evaluateEntryDecision({
-                side: selectedSide, projection: futureProjection, plan: selectedPlan,
-                feeKnown: fee.known, atr: atrValue, atrMultiple: 1.50,
-                roundTripCost: fee.known
-                    ? investment * leverage * (fee.openFeePercent + fee.closeFeePercent) / 100
-                    : 0,
-                costMultiple: 2
-            });
+            const vwapEl = document.getElementById('metric-vwap');
+            vwapEl.textContent = filters.ok && Number.isFinite(filters.vwap)
+                ? filters.vwap.toFixed(priceDecimals(filters.vwap)) : 'Unavailable';
+            const logTrendEl = document.getElementById('metric-log-trend');
+            const logPercent = (Math.exp(slope) - 1) * 100;
+            logTrendEl.textContent = `${logPercent >= 0 ? '+' : ''}${logPercent.toFixed(3)}% / candle · ${currentStatusText}`;
+            logTrendEl.style.color = currentStatusColor;
             lastFutureProjection = futureProjection;
             lastMarketFilters = filters;
             lastTradePlans = { long: longPlan, short: shortPlan };
-            lastEntryDecision = decision;
-            const decisionEl = document.getElementById('entry-decision');
-            decisionEl.textContent = decision.decision;
-            decisionEl.className = decision.allowed ? 'decision-go' : 'decision-stop';
-            document.getElementById('market-filter-summary').innerHTML = filters.ok
-                ? `<span title="Approximate ADX measures strength; efficiency measures how direct the move was.">Regime <b>${filters.regime === 'trend' ? 'TREND' : filters.regime === 'range' ? 'RANGE' : 'TRANSITION'} · approx. ADX ${filters.adx.toFixed(1)} · efficiency ${filters.efficiency.toFixed(2)}</b></span>`
-                    + `<span title="Relative volume ≥ 1.10 and position versus rolling VWAP confirm the breakout.">Liquidity <b>${filters.volumeAvailable ? `Relative volume ${filters.relativeVolume.toFixed(2)}× · 21-candle VWAP ${filters.vwap.toFixed(priceDecimals(filters.vwap))}` : 'VOLUME UNAVAILABLE'}</b></span>`
-                    + `<span title="Percentile versus recent history: P80 means volatility exceeds 80% of observations.">Volatility <b>ATR percentile ${filters.atrPercentile.toFixed(0)} · ${filters.volatility === 'high' ? 'HIGH RISK' : filters.volatility === 'low' ? 'LOW' : 'NORMAL'}</b></span>`
-                : `<span>${filters.error}</span>`;
-            document.getElementById('entry-checks').innerHTML = decision.checks
-                .map(check => `<div class="entry-check ${check.pass ? 'pass' : 'fail'}"><b>${check.pass ? '✓' : '×'}</b><span>${check.label}</span></div>`).join('');
             updateTradePlan();
         } catch (e) {
             console.error(`[ATR] 💥 Calculation error: ${e.message}`);
@@ -1507,35 +1665,31 @@
         if (timeframe !== lastTimeframe || symbol !== lastSymbol) {
             console.log(`%c[ATR] 🔄 Change detected: ${lastSymbol} -> ${symbol} (${timeframe})`, "color: yellow");
             isSyncing = true;
-            candlesHistory = []; lastBarTime = 0; lastClose = null; liveCandle = null;
+            candlesHistory = []; rawYahooCandles = []; lastBarTime = 0; lastClose = null; liveCandle = null;
             lastTimeframe  = timeframe; lastSymbol = symbol;
             lastMarketPrice = null; lastPriceSource = 'Yahoo Finance';
             lastBidPrice = null; lastAskPrice = null;
             historyAlignedToEtoro = false;
+            historyScaleFactor = 1;
+            historyPriceOffset = 0;
             lastCombinedAnalysis = null; lastAtrValue = null;
-            try {
-                const savedModel = JSON.parse(localStorage.getItem(`atr-model-${symbol}-${timeframe}`));
-                modelParams = savedModel?.params
-                    ? { ...window.EToroAnalytics.DEFAULT_MODEL_PARAMS, ...savedModel.params }
-                    : { ...window.EToroAnalytics.DEFAULT_MODEL_PARAMS };
-            } catch (_) {
-                modelParams = { ...window.EToroAnalytics.DEFAULT_MODEL_PARAMS };
-            }
-
             document.getElementById('atr-status').innerText = `${symbol} (${timeframe})`;
-            const { ySymbol, yInterval } = mapToYahoo(symbol, timeframe);
+            const { ySymbol, yInterval, sourceMinutes, targetMinutes } = mapToYahoo(symbol, timeframe);
             
             const rangeMap = {
                 '1m': '7d', '2m': '60d', '5m': '60d', '15m': '60d', '30m': '60d',
                 '60m': '2y', '1h': '2y', '4h': '2y', '1d': '5y', '1w': '10y'
             };
             const dataRange = rangeMap[timeframe] || '60d';
-            candlesHistory = await fetchHistory(ySymbol, yInterval, dataRange);
+            const downloadedCandles = await fetchHistory(ySymbol, yInterval, dataRange);
+            rawYahooCandles = downloadedCandles.map(candle => ({ ...candle }));
+            candlesHistory = mergeObservedEtoroCandles(
+                normalizeYahooCandles(downloadedCandles, sourceMinutes, targetMinutes), symbol, timeframe
+            );
             if (candlesHistory.length > 0) lastBarTime = candlesHistory[candlesHistory.length - 1].t * 1000;
             
             isSyncing = false;
             performCalculations(timeframe, symbol);
-            await calibrateHistoricalModel(symbol, timeframe, candlesHistory.map(candle => candle.c), 'full refresh');
         }
 
         refreshEtoroQuotes();
@@ -1572,12 +1726,7 @@
             document.getElementById('val-c').innerText = data.Close || '-';
 
             const now = Date.now();
-            const msMap = {
-                '1m': 60000, '2m': 120000, '5m': 300000, '15m': 900000,
-                '30m': 1800000, '60m': 3600000, '1h': 3600000,
-                '4h': 14400000, '1d': 86400000, '1w': 604800000
-            };
-            const barDuration = msMap[timeframe] || 60000;
+            const barDuration = timeframeToMinutes(timeframe) * 60000;
             const currentBarTime = Math.floor(now / barDuration) * barDuration;
 
             if (!liveCandle || currentBarTime > liveCandle.t * 1000) {
@@ -1585,9 +1734,10 @@
                 // Keep the current-period candle separate so it cannot contaminate
                 // ATR, Fourier, Wavelet, volume or calibration.
                 if (liveCandle && (!candlesHistory.length || liveCandle.t > candlesHistory.at(-1).t)) {
-                    candlesHistory.push(liveCandle);
+                    const closedEtoroCandle = { ...liveCandle, partial: false, source: 'etoro-observed' };
+                    candlesHistory.push(closedEtoroCandle);
+                    saveObservedEtoroCandle(symbol, timeframe, closedEtoroCandle);
                     if (candlesHistory.length > 5000) candlesHistory.shift();
-                    recalibrateIfAlignmentIsLow(symbol, timeframe, candlesHistory);
                 }
                 liveCandle = {
                     t: Math.floor(currentBarTime / 1000),
@@ -1596,7 +1746,8 @@
                     l: Number.isFinite(data.Low) ? data.Low : data.Close,
                     c: data.Close,
                     v: null,
-                    partial: true
+                    partial: true,
+                    source: 'etoro-observed'
                 };
                 lastBarTime = currentBarTime;
             } else {
@@ -1614,6 +1765,7 @@
 
     // Drag-and-drop logic.
     let isDragging = false;
+    let isResizing = false;
     let offsetX, offsetY;
 
     const canStartDrag = e => {
@@ -1628,7 +1780,7 @@
             || rect.bottom - e.clientY <= edgeSize;
         const inHeader = Boolean(e.target.closest('.atr-header-row'));
         const freeArea = e.target === ui || e.target.matches(
-            '#atr-content-body, .plugin-grid, .plugin-column, .analysis-head, .summary-line, .levels-panel, .trade-plan-panel, .model-info-panel'
+            '#atr-content-body, .analysis-head, .summary-line, .trade-plan-panel'
         );
         return onBorder || inHeader || freeArea;
     };
@@ -1643,7 +1795,26 @@
         e.preventDefault();
     });
 
+    const resizeHandle = document.getElementById('plugin-resize-handle');
+    let resizeOrigin = null;
+    resizeHandle.addEventListener('pointerdown', e => {
+        if (ui.classList.contains('atr-minimized')) return;
+        const rect = ui.getBoundingClientRect();
+        resizeOrigin = { x: e.clientX, y: e.clientY, width: rect.width, height: rect.height };
+        isResizing = true;
+        resizeHandle.setPointerCapture?.(e.pointerId);
+        e.preventDefault();
+        e.stopPropagation();
+    });
+
     document.addEventListener('pointermove', e => {
+        if (isResizing && resizeOrigin) {
+            const width = Math.min(window.innerWidth - 12, Math.max(440, resizeOrigin.width + e.clientX - resizeOrigin.x));
+            const height = Math.min(window.innerHeight - 45, Math.max(360, resizeOrigin.height + e.clientY - resizeOrigin.y));
+            ui.style.width = `${width}px`;
+            ui.style.height = `${height}px`;
+            return;
+        }
         if (!isDragging) return;
         const maxLeft = Math.max(0, window.innerWidth - Math.min(60, ui.offsetWidth));
         const maxTop = Math.max(0, window.innerHeight - Math.min(35, ui.offsetHeight));
@@ -1653,6 +1824,14 @@
     });
 
     const finishDragging = () => {
+        if (isResizing) {
+            isResizing = false;
+            resizeOrigin = null;
+            const rect = ui.getBoundingClientRect();
+            localStorage.setItem('atr-plugin-size', JSON.stringify({ width: rect.width, height: rect.height }));
+            performCalculations(lastTimeframe, lastSymbol);
+            return;
+        }
         if (!isDragging) return;
         isDragging = false;
         ui.classList.remove('is-dragging');
@@ -1662,7 +1841,12 @@
     document.addEventListener('pointerup', finishDragging);
     document.addEventListener('pointercancel', finishDragging);
 
-    // --- Listeners de Eventos (UI) ---
+    // Keep wheel and trackpad scrolling inside the panel instead of letting
+    // the underlying eToro page consume the event.
+    const scrollViewport = ui.querySelector('.single-analysis-view');
+    scrollViewport?.addEventListener('wheel', event => event.stopPropagation(), { passive: true });
+
+    // UI event listeners.
     document.getElementById('atr-min-btn').addEventListener('click', () => {
         const body = document.getElementById('atr-content-body');
         const isHidden = body.style.display === 'none';
@@ -1679,30 +1863,12 @@
     });
 
     document.getElementById('k-plus').addEventListener('click', () => {
-        if (visibleCyclesCount < 15) { 
+        if (visibleCyclesCount < 12) {
             visibleCyclesCount++;
             document.getElementById('k-count-label').innerText = visibleCyclesCount;
             const { symbol } = getMetadata();
             performCalculations(lastTimeframe, symbol);
         }
-    });
-
-    document.getElementById('trend-simulation-btn').addEventListener('click', () => {
-        const output = document.getElementById('trend-simulation-output');
-        const leverage = readNumber('lev-amount');
-        const fee = window.EToroAnalytics.getEtoroFeeProfile(lastSymbol, leverage);
-        const barsPerYearByTimeframe = { '1m': 60 * 24 * 252, '5m': 12 * 24 * 252, '15m': 4 * 24 * 252, '30m': 2 * 24 * 252, '1h': 24 * 252, '4h': 6 * 252, '1d': 252 };
-        const result = window.EToroAnalytics.compareTrendMethods(
-            candlesHistory.map(candle => candle.c),
-            { harmonics: 5, feePercent: fee.openFeePercent, barsPerYear: barsPerYearByTimeframe[lastTimeframe] || 24 * 252 }
-        );
-        if (!result.ok) {
-            output.innerHTML = `<span class="plan-warning">${result.error}</span>`;
-            return;
-        }
-        const row = (name, data) => `<div><b>${name}</b><span>Acierto ${(data.accuracy * 100).toFixed(1)}%</span><span>Ret. ${(data.return * 100).toFixed(1)}%</span><span>DD ${(data.maxDrawdown * 100).toFixed(1)}%</span><span>Sharpe ${data.sharpe.toFixed(2)}</span></div>`;
-        output.innerHTML = row('Log 16', result.logPrice) + row('Fourier ×5', result.fourier5)
-            + `<small>${result.logPrice.observations} predictions · cost ${result.feePercent.toFixed(3)}% per side · walk-forward</small>`;
     });
 
     // Button listeners.
@@ -1713,11 +1879,6 @@
             const { symbol } = getMetadata(); // <--- OBTENER SYMBOL
             performCalculations(lastTimeframe, symbol);
         }
-    });
-
-    document.getElementById('chk-show-price').addEventListener('change', () => {
-        const { symbol } = getMetadata();
-        performCalculations(lastTimeframe, symbol);
     });
 
     document.getElementById('w-plus').addEventListener('click', () => {
@@ -1736,6 +1897,63 @@
         }
     });
 
+    document.getElementById('history-count').addEventListener('change', event => {
+        visibleHistoryCount = Number(event.target.value);
+        localStorage.setItem('atr-plugin-history-count', visibleHistoryCount);
+        performCalculations(lastTimeframe, lastSymbol);
+    });
+    document.getElementById('projection-count').addEventListener('change', event => {
+        projectionBars = Number(event.target.value);
+        document.getElementById('projection-legend-count').textContent = projectionBars;
+        localStorage.setItem('atr-plugin-projection-bars', projectionBars);
+        performCalculations(lastTimeframe, lastSymbol);
+    });
+    document.getElementById('chart-price-mode').addEventListener('change', event => {
+        chartPriceMode = event.target.value;
+        localStorage.setItem('atr-plugin-chart-mode', chartPriceMode);
+        performCalculations(lastTimeframe, lastSymbol);
+    });
+    document.getElementById('chart-trade-side').addEventListener('change', event => {
+        chartTradeSide = event.target.value;
+        localStorage.setItem('atr-plugin-chart-side', chartTradeSide);
+        performCalculations(lastTimeframe, lastSymbol);
+    });
+    ['show-fourier', 'show-atr', 'show-tp', 'show-sl'].forEach(id => {
+        document.getElementById(id).addEventListener('change', () => performCalculations(lastTimeframe, lastSymbol));
+    });
+
+    document.getElementById('run-fourier-simulation').addEventListener('click', event => {
+        const button = event.currentTarget;
+        const output = document.getElementById('fourier-simulation-output');
+        button.disabled = true;
+        output.textContent = 'Running chronological simulation…';
+        requestAnimationFrame(() => setTimeout(() => {
+            const closedCandles = candlesHistory.filter(candle => !candle.partial && Number.isFinite(candle.c));
+            const horizonBars = Number(document.getElementById('simulation-horizon').value);
+            const atrMultiple = Number(document.getElementById('simulation-atr-multiple').value);
+            const result = window.EToroAnalytics.simulateFourierAtrStrategy(closedCandles, {
+                lookback: Math.min(128, visibleHistoryCount), horizonBars, atrMultiple
+            });
+            if (!result.ok) {
+                output.innerHTML = `<div class="simulation-error">${result.error}</div>`;
+            } else {
+                const bars = value => value === null ? '--' : `${value.toFixed(1)} candles`;
+                const row = (label, split) => `<div class="simulation-result"><b>${label} ${split.percent}%</b><strong class="${split.score >= 0 ? 'score-positive' : 'score-negative'}">${split.score >= 0 ? '+' : ''}${split.score}</strong><span>${split.signals} Fourier signals · ${split.wins} wins · ${split.losses} losses · ${split.unresolved} unresolved</span><small>Exceeded ${result.atrMultiple.toFixed(2)} ATR: ${(split.winRate * 100).toFixed(1)}% · projected arrival ${bars(split.projectedAverageBars)} · actual arrival ${bars(split.actualAverageBars)}</small></div>`;
+                const recordRows = [...(result.splits.test.records || []), ...(result.splits.real.records || [])].slice(-20).map(record => {
+                    const decimals = priceDecimals(record.entry);
+                    return `<div class="simulation-record"><b>${record.direction.toUpperCase()}</b><span>Entry ${record.entry.toFixed(decimals)} → target ${record.target.toFixed(decimals)}</span><small>Projected +${record.projectedHitBar} · actual ${record.actualHitBar === null ? 'not reached' : `+${record.actualHitBar}`} · ${record.outcome.toUpperCase()} ${record.points > 0 ? '+' : ''}${record.points}</small></div>`;
+                }).join('');
+                output.innerHTML = `<div class="simulation-params">Condition: reach ${result.atrMultiple.toFixed(2)} ATR within ${result.horizonBars} candles.<br>Selected on Train: ${result.params.harmonics} harmonics · minimum period ${result.params.minPeriodBars} candles · rolling window ${result.lookback}</div>`
+                    + row('Train', result.splits.train) + row('Test', result.splits.test) + row('Real', result.splits.real)
+                    + `<details class="simulation-details"><summary>Recent Test/Real signals</summary>${recordRows || '<p>No qualifying Fourier signals.</p>'}</details>`
+                    + '<p>A signal exists only when Fourier projects the selected ATR distance. A win means the market reached that directional price first; a loss means the opposite ATR was reached or the horizon ended against the signal. “Real” was never used to choose parameters.</p>';
+            }
+            button.disabled = false;
+        }, 0));
+    });
+
+    document.getElementById('download-diagnostic').addEventListener('click', downloadDiagnosticBundle);
+
     const btnRefresh = document.getElementById('atr-refresh-btn');
     btnRefresh.addEventListener('click', async () => {
         console.log("[ATR] 🖱️ User requested a manual refresh.");
@@ -1745,13 +1963,9 @@
         document.getElementById('atr-status').innerText = 'Refreshing everything…';
         document.getElementById('fourier-cycle').innerText = 'Updating…';
         document.getElementById('fourier-forecast-output').innerText = 'Rebuilding projection…';
-        document.getElementById('market-filter-summary').innerText = 'Recalculating filters…';
-        document.getElementById('entry-checks').innerText = '';
-        document.getElementById('entry-decision').innerText = 'NOT VIABLE';
         document.getElementById('trade-plan-output').innerText = 'Recalculating TP / SL…';
         document.getElementById('wavelet-components').innerText = 'Rebuilding Wavelet…';
-        document.getElementById('calibration-status').innerText = 'Recalculating constants…';
-        ['fourier-canvas', 'reconstruction-canvas', 'fourier-forecast-canvas', 'wavelet-canvas'].forEach(id => {
+        ['unified-analysis-canvas'].forEach(id => {
             const canvas = document.getElementById(id);
             canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
         });
@@ -1759,6 +1973,7 @@
         lastSymbol = null;
         lastTimeframe = null;
         candlesHistory = [];
+        rawYahooCandles = [];
         liveCandle = null;
         lastBarTime = 0;
         lastClose = null;
@@ -1768,6 +1983,8 @@
         lastCombinedAnalysis = null;
         lastAtrValue = null;
         historyAlignedToEtoro = false;
+        historyScaleFactor = 1;
+        historyPriceOffset = 0;
         try {
             await monitor();
             if (!lastSymbol || !lastTimeframe || !candlesHistory.length) {
@@ -1777,11 +1994,8 @@
             performCalculations(lastTimeframe, lastSymbol);
             updateBreakEven();
             updateTradePlan();
-            document.getElementById('trend-simulation-btn').click();
-            await runOpportunityScanner();
         } catch (error) {
             document.getElementById('atr-status').innerText = 'Refresh failed';
-            document.getElementById('calibration-status').innerText = error.message;
             console.error('[ATR] Full refresh failed:', error);
         } finally {
             btnRefresh.classList.remove('spinning');
@@ -1789,7 +2003,7 @@
         }
     });
 
-    // Lanzamiento
+    // Startup.
     let quoteRefreshTimer = null;
     const quoteObserver = new MutationObserver(() => {
         if (quoteRefreshTimer) return;
@@ -1800,8 +2014,6 @@
     });
     quoteObserver.observe(document.body, { subtree: true, childList: true, characterData: true });
     monitor();
-    scheduleOpportunityScanner();
-    runOpportunityScanner();
     setInterval(refreshEtoroQuotes, 1000);
     setInterval(monitor, 10000);
 })();
