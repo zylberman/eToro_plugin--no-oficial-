@@ -3,6 +3,18 @@
  * The content script requests data through messaging; the actual request is made here.
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'showOpportunityNotification') {
+    const notificationId = `etoro-opportunity-${request.symbol || 'asset'}-${request.side || 'side'}`;
+    chrome.notifications.create(notificationId, {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: request.title || 'eToro opportunity checklist',
+      message: request.message || 'A trade setup reached the configured checklist threshold.',
+      priority: 1
+    });
+    sendResponse({ ok: true });
+    return false;
+  }
   if (request.action !== 'fetchYahooChart') return false;
 
   (async () => {

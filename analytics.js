@@ -310,13 +310,148 @@
             const volumeTotal = volumeRows.reduce((sum, row) => sum + row.v, 0);
             vwap = volumeRows.reduce((sum, row) => sum + ((row.h + row.l + row.c) / 3) * row.v, 0) / volumeTotal;
         }
+        const closes = rows.map(row => row.c);
+        const emaSeries = (values, length) => {
+            const alpha = 2 / (length + 1);
+            const output = [];
+            values.forEach((value, index) => output.push(index ? value * alpha + output[index - 1] * (1 - alpha) : value));
+            return output;
+        };
+        const ema20 = emaSeries(closes, 20).at(-1);
+        const ema50 = emaSeries(closes, 50).at(-1);
+        const rsiPeriod = Math.min(14, closes.length - 1);
+        let gains = 0, losses = 0;
+        for (let index = closes.length - rsiPeriod; index < closes.length; index++) {
+            const change = closes[index] - closes[index - 1];
+            if (change >= 0) gains += change; else losses -= change;
+        }
+        const averageGain = gains / rsiPeriod;
+        const averageLoss = losses / rsiPeriod;
+        const rsi = averageLoss <= EPSILON ? 100 : 100 - 100 / (1 + averageGain / averageLoss);
+        const ema12Series = emaSeries(closes, 12);
+        const ema26Series = emaSeries(closes, 26);
+        const macdSeries = closes.map((_, index) => ema12Series[index] - ema26Series[index]);
+        const macd = macdSeries.at(-1);
+        const macdSignal = emaSeries(macdSeries, 9).at(-1);
+        const macdHistogram = macd - macdSignal;
+        const bollingerSample = closes.slice(-20);
+        const bollingerMiddle = bollingerSample.reduce((sum, value) => sum + value, 0) / bollingerSample.length;
+        const bollingerDeviation = Math.sqrt(bollingerSample.reduce((sum, value) => sum + (value - bollingerMiddle) ** 2, 0) / bollingerSample.length);
+        const bollingerUpper = bollingerMiddle + bollingerDeviation * 2;
+        const bollingerLower = bollingerMiddle - bollingerDeviation * 2;
+        const bollingerPosition = bollingerDeviation > EPSILON ? (closes.at(-1) - bollingerMiddle) / (bollingerDeviation * 2) : 0;
+        const lastRow = rows.at(-1);
+        const lastRange = lastRow.h - lastRow.l;
+        const candleCloseLocation = lastRange > EPSILON ? (lastRow.c - lastRow.l) / lastRange : 0.5;
         return {
             ok: true, adx, efficiency, direction, regime, currentAtr, atrPercentile,
             volatility: atrPercentile >= 80 ? 'high' : atrPercentile <= 30 ? 'low' : 'normal',
             volumeAvailable, relativeVolume, vwap, currentPrice: rows.at(-1).c,
             volumeConfirmsLong: volumeAvailable && relativeVolume >= 1.10 && rows.at(-1).c >= vwap,
-            volumeConfirmsShort: volumeAvailable && relativeVolume >= 1.10 && rows.at(-1).c <= vwap
+            volumeConfirmsShort: volumeAvailable && relativeVolume >= 1.10 && rows.at(-1).c <= vwap,
+            ema20, ema50, emaDirection: Math.sign(ema20 - ema50),
+            rsi, macd, macdSignal, macdHistogram,
+            bollingerMiddle, bollingerUpper, bollingerLower, bollingerPosition,
+            candleCloseLocation
         };
+    }
+
+    function analyzeTechnicalConfluence(options = {}) {
+        const side = options.side === 'short' ? 'short' : 'long';
+        const sign = side === 'long' ? 1 : -1;
+        const filters = options.filters || {};
+        const projection = options.projection || {};
+        const plan = options.plan || {};
+        const best = plan.best || {};
+        const entryChecks = Array.isArray(options.entryChecks) ? options.entryChecks : [];
+        const checkPassed = key => entryChecks.find(check => check.key === key)?.pass === true;
+        const indicator = (key, label, tier, order, available, pass, detail) => ({
+            key, label, tier, order, available: available === true, pass: available === true && pass === true, detail
+        });
+        const majors = [
+            indicator('fourier', 'Fourier direction and stability', 'major', 1, projection.ok === true,
+                checkPassed('fourierStable') && checkPassed('cycleDirection') && checkPassed('projectionOrder'),
+                projection.stability ? `stability ${(projection.stability.score * 100).toFixed(0)}/100` : 'unavailable'),
+            indicator('wavelet', 'Wavelet structural SL and TP', 'major', 2, plan.ok === true,
+                checkPassed('waveletStop') && checkPassed('waveletTarget'), plan.fallback ? 'ATR fallback, not structural' : 'structural zones'),
+            indicator('regime', 'ADX and directional efficiency', 'major', 3, filters.ok === true,
+                filters.regime === 'trend' && filters.direction === sign,
+                `ADX ${finiteNumber(filters.adx).toFixed(1)} · efficiency ${(finiteNumber(filters.efficiency) * 100).toFixed(0)}% · ${filters.regime || 'unknown'}`),
+            indicator('ema', 'EMA20/EMA50 trend alignment', 'major', 4, Number.isFinite(filters.ema20) && Number.isFinite(filters.ema50),
+                filters.emaDirection === sign, `EMA20 ${finiteNumber(filters.ema20).toFixed(2)} · EMA50 ${finiteNumber(filters.ema50).toFixed(2)}`),
+            indicator('vwap', 'Price location versus VWAP', 'major', 5, Number.isFinite(filters.vwap),
+                sign > 0 ? filters.currentPrice >= filters.vwap : filters.currentPrice <= filters.vwap,
+                Number.isFinite(filters.vwap) ? `price ${finiteNumber(filters.currentPrice).toFixed(2)} · VWAP ${filters.vwap.toFixed(2)}` : 'volume unavailable'),
+            indicator('rvol', 'Relative volume confirmation', 'major', 6, filters.volumeAvailable === true && Number.isFinite(filters.relativeVolume),
+                filters.relativeVolume >= 1.20 && (sign > 0 ? filters.volumeConfirmsLong : filters.volumeConfirmsShort),
+                Number.isFinite(filters.relativeVolume) ? `RVOL ${filters.relativeVolume.toFixed(2)}×` : 'volume unavailable')
+        ];
+        const minors = [
+            indicator('rsi', 'RSI(14) directional zone', 'minor', 1, Number.isFinite(filters.rsi),
+                sign > 0 ? filters.rsi >= 52 && filters.rsi <= 72 : filters.rsi <= 48 && filters.rsi >= 28,
+                `RSI ${finiteNumber(filters.rsi).toFixed(1)}`),
+            indicator('macd', 'MACD histogram direction', 'minor', 2, Number.isFinite(filters.macdHistogram),
+                Math.sign(filters.macdHistogram) === sign, `histogram ${finiteNumber(filters.macdHistogram).toFixed(4)}`),
+            indicator('bollinger', 'Bollinger position is directional but not extreme', 'minor', 3, Number.isFinite(filters.bollingerPosition),
+                sign > 0 ? filters.bollingerPosition >= 0 && filters.bollingerPosition <= 1.10
+                    : filters.bollingerPosition <= 0 && filters.bollingerPosition >= -1.10,
+                `position ${finiteNumber(filters.bollingerPosition).toFixed(2)}σ-band`),
+            indicator('volatility', 'ATR percentile is tradable, not extreme', 'minor', 4, Number.isFinite(filters.atrPercentile),
+                filters.atrPercentile >= 20 && filters.atrPercentile <= 85,
+                `percentile ${finiteNumber(filters.atrPercentile).toFixed(0)}`),
+            indicator('candle', 'Latest candle closes with directional strength', 'minor', 5, Number.isFinite(filters.candleCloseLocation),
+                sign > 0 ? filters.candleCloseLocation >= 0.65 : filters.candleCloseLocation <= 0.35,
+                `close location ${(finiteNumber(filters.candleCloseLocation) * 100).toFixed(0)}% of range`)
+        ];
+        const availableMajors = majors.filter(item => item.available);
+        const availableMinors = minors.filter(item => item.available);
+        const majorPassed = majors.filter(item => item.pass).length;
+        const minorPassed = minors.filter(item => item.pass).length;
+        const severalMajors = majorPassed >= 4;
+        const severalMinors = minorPassed >= 4 && majorPassed >= 2;
+        const mixed = majorPassed >= 3 && minorPassed >= 2;
+        const weightedPassed = majorPassed * 2 + minorPassed;
+        const weightedAvailable = availableMajors.length * 2 + availableMinors.length;
+        const score = weightedAvailable ? weightedPassed / weightedAvailable : 0;
+        const potentialLoss = finiteNumber(best.potentialLoss, NaN);
+        const potentialProfit = finiteNumber(best.potentialProfit, NaN);
+        const roundTripCost = Math.max(0, finiteNumber(options.roundTripCost));
+        const netProfit = potentialProfit - roundTripCost;
+        const netLoss = potentialLoss + roundTripCost;
+        const netRewardRisk = netLoss > EPSILON ? netProfit / netLoss : 0;
+        const minimumStopUsd = Math.max(0, finiteNumber(options.minimumStopUsd, 1));
+        const maximumStopUsd = Math.max(minimumStopUsd, finiteNumber(options.maximumStopUsd, 3));
+        const riskGates = [
+            { key: 'fourierCore', label: 'Core Fourier signal is stable, directional, and reaches TP before SL',
+                pass: majors.find(item => item.key === 'fourier')?.pass === true },
+            { key: 'waveletCore', label: 'Wavelet supplies structural SL and TP zones',
+                pass: majors.find(item => item.key === 'wavelet')?.pass === true },
+            { key: 'plan', label: 'TP and SL price levels exist', pass: plan.ok === true },
+            { key: 'stopBudget', label: `SL risk is between $${minimumStopUsd.toFixed(2)} and $${maximumStopUsd.toFixed(2)}`,
+                pass: potentialLoss >= minimumStopUsd && potentialLoss <= maximumStopUsd },
+            { key: 'netRewardRisk', label: 'Net TP is at least the net SL risk', pass: netRewardRisk >= 1 },
+            { key: 'cost', label: 'Gross TP covers round-trip costs at least twice', pass: potentialProfit >= roundTripCost * 2 }
+        ];
+        const gatesPass = riskGates.every(gate => gate.pass);
+        const pattern = severalMajors ? 'SEVERAL MAJOR INDICATORS'
+            : mixed ? 'MIXED MAJOR + MINOR CONFIRMATION'
+            : severalMinors ? 'SEVERAL MINOR INDICATORS · WATCH ONLY'
+            : 'INSUFFICIENT CONFLUENCE';
+        const operable = gatesPass && (severalMajors || mixed);
+        const investment = finiteNumber(options.investment, NaN);
+        const scaledPlans = [1, 2, 3].map(stopUsd => {
+            const scale = potentialLoss > EPSILON ? stopUsd / potentialLoss : NaN;
+            const scaledCost = roundTripCost * scale;
+            const grossTpUsd = potentialProfit * scale;
+            return { stopUsd, investment: investment * scale, grossTpUsd, netTpUsd: grossTpUsd - scaledCost,
+                netSlUsd: stopUsd + scaledCost, netRewardRisk: (grossTpUsd - scaledCost) / Math.max(EPSILON, stopUsd + scaledCost) };
+        });
+        return { side, majors, minors, majorPassed, minorPassed, availableMajorCount: availableMajors.length,
+            availableMinorCount: availableMinors.length, weightedPassed, weightedAvailable, score,
+            severalMajors, severalMinors, mixed, pattern, riskGates, gatesPass, operable,
+            entryPrice: finiteNumber(best.entryPrice), tpPrice: finiteNumber(best.technicalTarget),
+            slPrice: finiteNumber(best.technicalStop), potentialProfit, potentialLoss,
+            netProfit, netLoss, netRewardRisk, scaledPlans };
     }
 
     function evaluateEntryDecision(options = {}) {
@@ -326,41 +461,79 @@
         const best = plan.best || {};
         const expectedDirection = side === 'long' ? 'up' : 'down';
         const atr = Math.max(0, finiteNumber(options.atr));
-        const atrMultiple = Math.max(1, finiteNumber(options.atrMultiple, 1.5));
+        const atrMultiple = Math.max(1, finiteNumber(options.atrMultiple, 1));
         const minimumStopDistance = atr * atrMultiple;
         const roundTripCost = Math.max(0, finiteNumber(options.roundTripCost));
         const openingCost = Math.max(0, finiteNumber(options.openingCost));
         const feeKnown = options.feeKnown !== false;
-        const excursion = options.costExcursion || {};
-        const hasWaveletTarget = Number.isFinite(best.targetIndex) && best.targetIndex > 0;
-        const hasWaveletStop = Number.isFinite(best.stopIndex) && best.stopIndex > 0;
-        const projectedToTarget = projection.ok === true
-            && projection.winner?.direction === expectedDirection
-            && Number.isFinite(projection.winner?.targetBar);
-        const requiredNetMultiple = Math.max(1, finiteNumber(options.requiredNetMultiple, 2));
-        const costThreshold = roundTripCost + openingCost * requiredNetMultiple;
+        const hasWaveletTarget = !plan.fallback && Number.isFinite(best.targetIndex) && best.targetIndex >= 0;
+        const hasWaveletStop = !plan.fallback && Number.isFinite(best.stopIndex) && best.stopIndex >= 0;
+        const forecast = Array.isArray(projection.forecast) ? projection.forecast : [];
+        let projectedTargetBar = null;
+        let projectedStopBar = null;
+        for (let step = 1; step < forecast.length; step++) {
+            const price = forecast[step];
+            if (!Number.isFinite(price)) continue;
+            if (projectedTargetBar === null && (side === 'long'
+                ? price >= finiteNumber(best.technicalTarget, Infinity)
+                : price <= finiteNumber(best.technicalTarget, -Infinity))) projectedTargetBar = step;
+            if (projectedStopBar === null && (side === 'long'
+                ? price <= finiteNumber(best.technicalStop, -Infinity)
+                : price >= finiteNumber(best.technicalStop, Infinity))) projectedStopBar = step;
+        }
+        const projectedToTarget = projection.ok === true && projection.enabled === true
+            && projectedTargetBar !== null
+            && (projectedStopBar === null || projectedTargetBar < projectedStopBar);
+        const cycles = Array.isArray(projection.cycleDirections) ? projection.cycleDirections : [];
+        const alignedCycles = cycles.filter(cycle => cycle.direction === expectedDirection).length;
+        const cycleAgreement = cycles.length ? alignedCycles / cycles.length : 0;
+        const stableFourier = projection.ok === true && projection.stability?.stable === true;
+        const directionConsistent = cycles.length >= 2 && cycleAgreement >= 2 / 3;
+        const technicalRoom = plan.ok === true && hasWaveletTarget
+            && finiteNumber(best.targetDistance) > finiteNumber(best.stopDistance);
+        const stopOutsideNoise = plan.ok === true && atr > 0
+            && finiteNumber(best.stopDistance) >= minimumStopDistance;
+        const netProfit = feeKnown ? finiteNumber(best.potentialProfit) - roundTripCost : null;
+        const netLoss = feeKnown ? finiteNumber(best.potentialLoss) + roundTripCost : null;
+        const netRewardCoversRisk = feeKnown && netProfit >= netLoss;
+        const grossCoversCosts = feeKnown && finiteNumber(best.potentialProfit) >= roundTripCost * 2;
+        const spread = Math.max(0, finiteNumber(options.spread, NaN));
+        const spreadBaseline = Math.max(0, finiteNumber(options.spreadBaseline, NaN));
+        const spreadSampleCount = Math.max(0, Math.floor(finiteNumber(options.spreadSampleCount)));
+        const spreadNormal = Number.isFinite(spread) && spreadSampleCount >= 20
+            && spread <= Math.max(spreadBaseline * 1.5, EPSILON)
+            && spread <= atr * 0.10;
         const checks = [
-            { key: 'wavelet', label: hasWaveletTarget && hasWaveletStop
-                ? 'TP and SL come from Wavelet zones'
-                : 'Valid ATR/RR fallback replaces an incomplete Wavelet pair', pass: plan.ok === true },
-            { key: 'fourier', label: 'Fourier exceeds 1 ATR and reaches this TP within 10 candles', pass: projectedToTarget },
-            { key: 'atr', label: `SL outside noise: distance ≥ ${atrMultiple.toFixed(2)} ATR`, pass: plan.ok === true && atr > 0 && finiteNumber(best.stopDistance) >= minimumStopDistance },
-            { key: 'riskReward', label: 'TP ≥ 1.5 × SL', pass: plan.ok === true && finiteNumber(best.rewardRisk) >= 1.5 },
-            { key: 'cost', label: feeKnown
-                ? `Net profit ≥ ${requiredNetMultiple.toFixed(1)}× opening cost after round-trip costs`
-                : 'Verifiable round-trip cost', pass: feeKnown && plan.ok === true && finiteNumber(best.potentialProfit) >= costThreshold },
-            { key: 'excursion', label: excursion.ok
-                ? `Historical favorable excursion reaches the cost target ${(excursion.hitRate * 100).toFixed(0)}% of the time; median ${Number.isFinite(excursion.medianHitBars) ? `${excursion.medianHitBars.toFixed(1)} candles` : '--'}`
-                : 'Cost-adjusted historical excursion is available', pass: excursion.ok === true && excursion.viable === true }
+            { key: 'fourierStable', label: 'Fourier is stable across 64/96/128-candle windows', pass: stableFourier,
+                detail: projection.stability ? `Stability ${(projection.stability.score * 100).toFixed(0)}/100` : 'Unavailable' },
+            { key: 'cycleDirection', label: 'Several validated Fourier cycles agree with the direction', pass: directionConsistent,
+                detail: `${alignedCycles}/${cycles.length} cycles point ${expectedDirection}` },
+            { key: 'projectionOrder', label: 'The projection reaches TP before SL', pass: projectedToTarget,
+                detail: `TP ${projectedTargetBar === null ? 'not reached' : `+${projectedTargetBar} candles`} · SL ${projectedStopBar === null ? 'not reached' : `+${projectedStopBar} candles`}` },
+            { key: 'waveletStop', label: 'Wavelet provides a real structural zone for SL', pass: hasWaveletStop,
+                detail: plan.fallback ? 'ATR fallback is not a Wavelet confirmation' : `Zone #${best.stopIndex ?? '--'}` },
+            { key: 'waveletTarget', label: 'A Wavelet target zone has sufficient room', pass: technicalRoom,
+                detail: `TP distance ${finiteNumber(best.targetDistance).toFixed(4)} · SL distance ${finiteNumber(best.stopDistance).toFixed(4)}` },
+            { key: 'atr', label: `SL is outside at least ${atrMultiple.toFixed(2)} ATR of noise`, pass: stopOutsideNoise,
+                detail: `${atr > 0 ? (finiteNumber(best.stopDistance) / atr).toFixed(2) : '--'} ATR` },
+            { key: 'netRiskReward', label: 'Net TP value is at least the net SL risk', pass: netRewardCoversRisk,
+                detail: feeKnown ? `+$${netProfit.toFixed(2)} versus −$${netLoss.toFixed(2)}` : 'Costs unavailable' },
+            { key: 'costCoverage', label: 'Gross TP covers round-trip costs at least twice', pass: grossCoversCosts,
+                detail: feeKnown ? `$${finiteNumber(best.potentialProfit).toFixed(2)} versus required $${(roundTripCost * 2).toFixed(2)}` : 'Costs unavailable' },
+            { key: 'spread', label: 'Current spread is not abnormal', pass: spreadNormal,
+                detail: Number.isFinite(spread) ? `${spread.toFixed(4)} now · ${Number.isFinite(spreadBaseline) ? spreadBaseline.toFixed(4) : '--'} median · ${spreadSampleCount} samples` : 'Spread unavailable' }
         ];
-        const allowed = checks.every(check => check.pass);
+        const dataVerified = options.dataVerified === true;
+        const allowed = dataVerified && checks.every(check => check.pass);
         return {
             side, allowed,
             decision: allowed ? (side === 'long' ? 'LONG IS VIABLE' : 'SHORT IS VIABLE') : 'NOT VIABLE',
-            checks, projectedToTarget, hasWaveletTarget, hasWaveletStop,
-            minimumStopDistance, openingCost, roundTripCost, costThreshold, costExcursion: excursion,
+            dataVerified, dataDetail: String(options.dataDetail || 'Market-series fidelity was not verified.'),
+            checks, projectedToTarget, projectedTargetBar, projectedStopBar,
+            hasWaveletTarget, hasWaveletStop, cycleAgreement,
+            minimumStopDistance, openingCost, roundTripCost,
             grossProfit: finiteNumber(best.potentialProfit),
-            netProfit: feeKnown ? finiteNumber(best.potentialProfit) - roundTripCost : null
+            netProfit, netLoss
         };
     }
 
@@ -673,6 +846,29 @@
         return spectrum.sort((a, b) => b.magnitude - a.magnitude);
     }
 
+    // Diagnostic reconstruction uses the ordinary, integer-bin DFT. Unlike the
+    // predictive peak model below, these basis functions are orthogonal: every
+    // additional component can only preserve or reduce in-sample squared error,
+    // and the complete set reconstructs the detrended series (apart from the
+    // Nyquist term for even sample sizes). Hann-windowed, fractional peaks remain
+    // appropriate for cycle detection but must not be presented as an exact
+    // cumulative Fourier reconstruction.
+    function fitFourierReconstruction(values, requestedComponents) {
+        const n = values.length;
+        const logs = values.map(Math.log);
+        const line = regression(logs);
+        const residuals = logs.map((value, index) => value - line.intercept - line.slope * index);
+        const maximum = Math.max(1, Math.floor((n - 1) / 2));
+        const count = Math.max(1, Math.min(maximum, Math.floor(finiteNumber(requestedComponents, 1))));
+        const selected = spectrumOf(residuals, false).slice(0, count);
+        const residualAt = index => selected.reduce((sum, component) => {
+            const angle = 2 * Math.PI * component.k * index / n;
+            return sum + 2 / n * (component.real * Math.cos(angle) - component.imag * Math.sin(angle));
+        }, 0);
+        const logAt = index => line.intercept + line.slope * index + residualAt(index);
+        return { n, logs, line, selected, residualAt, logAt, maximum };
+    }
+
     function fourierComponentDirection(component, sampleSize, index = sampleSize - 1) {
         const n = Math.max(2, Math.floor(finiteNumber(sampleSize, 0)));
         const k = Math.max(0.5, finiteNumber(component?.k, 1));
@@ -872,16 +1068,12 @@
         }
         if (!best) return null;
         const model = fit(values, best.count);
-        // Display all requested components, including fast cycles excluded from
-        // the predictive model by its minimum-period rule.
-        const requestedModel = fit(values, requestedHarmonics, 2);
         const meanLog = model.logs.reduce((sum, value) => sum + value, 0) / model.logs.length;
         return {
             ...model, chosenHarmonics: best.count, validationMae: best.mae,
             validationDirectionAccuracy: best.directionAccuracy, validationErrors: best.errors,
             fittedHistory: values.map((_, index) => Math.exp(model.logAt(index))),
-            cycleHistory: values.map((_, index) => Math.exp(meanLog + model.residualAt(index))),
-            requestedModel
+            cycleHistory: values.map((_, index) => Math.exp(meanLog + model.residualAt(index)))
         };
     }
 
@@ -891,12 +1083,13 @@
             return { ok: false, error: 'At least 64 closes and a valid ATR are required.' };
         }
         const horizonBars = Math.max(1, Math.min(100, Math.floor(finiteNumber(options.horizonBars, 24))));
-        const requestedHarmonics = Math.max(1, Math.min(12, Math.floor(finiteNumber(options.harmonics, 5))));
+        const requestedHarmonics = Math.max(1, Math.min(32, Math.floor(finiteNumber(options.harmonics, 5))));
+        const predictiveHarmonics = Math.min(12, requestedHarmonics);
         const minPeriodBars = Math.max(6, Math.floor(finiteNumber(options.minPeriodBars, Math.max(10, horizonBars / 2))));
         const windows = [64, 96, 128].filter(size => size <= allValues.length);
         const models = windows.map(size => {
             const values = allValues.slice(-size);
-            const model = fitFourierWindow(values, requestedHarmonics, minPeriodBars);
+            const model = fitFourierWindow(values, predictiveHarmonics, minPeriodBars);
             if (!model) return null;
             const dominant = model.selected[0];
             const phase = dominant ? fourierComponentDirection(dominant, size) : null;
@@ -945,7 +1138,7 @@
             Math.exp(cumulativeLogAt(index, componentIndex + 1))));
         const cumulativeForecasts = model.selected.map((_, componentIndex) => Array.from({ length: horizonBars + 1 }, (_, step) =>
             Math.exp(cumulativeLogAt(n - 1 + step, componentIndex + 1))));
-        const displayModel = model.requestedModel || model;
+        const displayModel = fitFourierReconstruction(chosen.values, requestedHarmonics);
         const displayLogAt = (index, count) => displayModel.line.intercept + displayModel.line.slope * index
             + displayModel.selected.slice(0, count).reduce((sum, component) => {
                 const angle = 2 * Math.PI * component.k * index / n;
@@ -955,6 +1148,10 @@
             Math.exp(displayLogAt(index, componentIndex + 1))));
         const displayCumulativeForecasts = displayModel.selected.map((_, componentIndex) => Array.from({ length: horizonBars + 1 }, (_, step) =>
             Math.exp(displayLogAt(n - 1 + step, componentIndex + 1))));
+        const reconstructionErrors = displayCumulativeHistories.map(series => {
+            const squaredError = series.reduce((sum, value, index) => sum + (value - chosen.values[index]) ** 2, 0);
+            return Math.sqrt(squaredError / series.length);
+        });
         const sortedAbsErrors = model.validationErrors.map(Math.abs).sort((a, b) => a - b);
         const errorQuantile = sortedAbsErrors[Math.min(sortedAbsErrors.length - 1, Math.floor(sortedAbsErrors.length * 0.90))] || 0;
         const lowerBand = forecast.map((value, step) => value * Math.exp(-errorQuantile * Math.sqrt(Math.max(1, step))));
@@ -989,9 +1186,9 @@
         candidates.sort((a, b) => a.targetBar - b.targetBar);
         const winner = candidates[0] || null;
         const cycleDirections = model.selected.map(component => ({ k: component.k, period: n / component.k, ...fourierComponentDirection(component, n) }));
-        const retainedFrequencies = new Set(model.selected.map(component => component.k));
         const displayCycleDirections = displayModel.selected.map(component => ({
-            k: component.k, period: n / component.k, retained: retainedFrequencies.has(component.k),
+            k: component.k, period: n / component.k,
+            retained: model.selected.some(retained => Math.abs(retained.k - component.k) <= 0.55),
             ...fourierComponentDirection(component, n)
         }));
         const directionSign = winner?.direction === 'up' ? 1 : winner?.direction === 'down' ? -1 : 0;
@@ -1001,6 +1198,12 @@
             minPeriodBars, current, adaptiveWindow: n, fittedHistory: model.fittedHistory, cycleHistory: model.cycleHistory,
             cumulativeHistories, cumulativeForecasts,
             displayCumulativeHistories, displayCumulativeForecasts, displayCycleDirections,
+            reconstructionDiagnostics: {
+                components: displayModel.selected.length,
+                maximumComponents: displayModel.maximum,
+                rmseByComponent: reconstructionErrors,
+                finalRmse: reconstructionErrors.at(-1)
+            },
             endpointError, endpointErrorAtr, empiricalCoverage, empiricalBandQuantile: 0.90,
             validationMae: model.validationMae, validationDirectionAccuracy: model.validationDirectionAccuracy,
             fitDiagnostics: { mae: fitMae, rmse: fitRmse, bias: fitBias, maxError: fitMaxError,
@@ -1520,7 +1723,7 @@
     }
 
     return {
-        calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, analyzeCostAdjustedExcursion, calculateOpportunityRisk, analyzeMarketFilters, evaluateEntryDecision, calculateMultiLevelTradePlan, calculateBestZoneTradePlan,
+        calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, analyzeCostAdjustedExcursion, calculateOpportunityRisk, analyzeMarketFilters, analyzeTechnicalConfluence, evaluateEntryDecision, calculateMultiLevelTradePlan, calculateBestZoneTradePlan,
         fourierComponentDirection, compareTrendMethods, projectFourierToTargets, simulateFourierHoldout, simulateFourierAtrStrategy, estimateTrendBreak,
         haarTransitionScore, haarScalogram, haarDecompose, haarReconstruct,
         haarWaveletAnalysis, findWaveletZones, analyzeCombined, aggregateCandlesToTimeframe,

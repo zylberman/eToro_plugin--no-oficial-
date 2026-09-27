@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, analyzeCostAdjustedExcursion, calculateOpportunityRisk, analyzeMarketFilters, evaluateEntryDecision, calculateMultiLevelTradePlan,
+    calculateBreakEvenTP, getEtoroFeeProfile, calculateTradePlan, calculateTicketRiskLevels, analyzeCostAdjustedExcursion, calculateOpportunityRisk, analyzeMarketFilters, analyzeTechnicalConfluence, evaluateEntryDecision, calculateMultiLevelTradePlan,
     calculateBestZoneTradePlan, fourierComponentDirection, compareTrendMethods,
     projectFourierToTargets, simulateFourierHoldout, simulateFourierAtrStrategy, estimateTrendBreak,
     haarTransitionScore, haarScalogram, haarDecompose,
@@ -90,30 +90,82 @@ test('market filters identify a liquid directional regime and ATR percentile', (
     assert.equal(result.direction, 1);
     assert.equal(result.volumeAvailable, true);
     assert.equal(result.volumeConfirmsLong, true);
+    assert.ok(Number.isFinite(result.ema20));
+    assert.ok(Number.isFinite(result.ema50));
+    assert.ok(Number.isFinite(result.rsi));
+    assert.ok(Number.isFinite(result.macdHistogram));
+    assert.ok(Number.isFinite(result.bollingerPosition));
     assert.ok(result.atrPercentile >= 0 && result.atrPercentile <= 100);
 });
 
-test('entry gate ignores volume when Fourier, Wavelet/ATR, reward and costs are viable', () => {
+test('technical confluence accepts several major confirmations only when monetary risk gates pass', () => {
+    const entryChecks = ['fourierStable', 'cycleDirection', 'projectionOrder', 'waveletStop', 'waveletTarget']
+        .map(key => ({ key, pass: true }));
+    const result = analyzeTechnicalConfluence({
+        side: 'long', investment: 50, roundTripCost: 0.20, minimumStopUsd: 1, maximumStopUsd: 3,
+        projection: { ok: true, stability: { score: 0.82 } },
+        plan: { ok: true, fallback: false, best: { entryPrice: 100, technicalTarget: 104, technicalStop: 98,
+            potentialProfit: 4, potentialLoss: 2 } },
+        entryChecks,
+        filters: { ok: true, regime: 'trend', direction: 1, adx: 27, efficiency: 0.42,
+            currentPrice: 102, ema20: 101, ema50: 99, emaDirection: 1,
+            volumeAvailable: true, relativeVolume: 1.4, volumeConfirmsLong: true, volumeConfirmsShort: false,
+            vwap: 100, rsi: 61, macdHistogram: 0.3, bollingerPosition: 0.5,
+            atrPercentile: 55, candleCloseLocation: 0.8 }
+    });
+    assert.equal(result.operable, true);
+    assert.equal(result.majorPassed, 6);
+    assert.ok(result.netRewardRisk > 1);
+    assert.equal(result.scaledPlans.length, 3);
+    assert.ok(Math.abs(result.scaledPlans[1].investment - 50) < 1e-9);
+});
+
+test('minor confirmations alone cannot override an oversized stop', () => {
+    const result = analyzeTechnicalConfluence({
+        side: 'long', investment: 50, roundTripCost: 0.20,
+        projection: { ok: false }, entryChecks: [],
+        plan: { ok: true, fallback: true, best: { entryPrice: 100, technicalTarget: 110, technicalStop: 95,
+            potentialProfit: 5, potentialLoss: 4 } },
+        filters: { ok: true, regime: 'range', direction: 0, adx: 12, efficiency: 0.1,
+            currentPrice: 102, ema20: 99, ema50: 100, emaDirection: -1,
+            volumeAvailable: false, rsi: 60, macdHistogram: 0.2, bollingerPosition: 0.5,
+            atrPercentile: 50, candleCloseLocation: 0.8 }
+    });
+    assert.equal(result.operable, false);
+    assert.equal(result.riskGates.find(gate => gate.key === 'stopBudget').pass, false);
+});
+
+const validatedLongProjection = {
+    ok: true, enabled: true, forecast: [100, 101, 103],
+    stability: { stable: true, score: 0.8 },
+    cycleDirections: [{ direction: 'up' }, { direction: 'up' }, { direction: 'down' }]
+};
+const structuralLongPlan = {
+    ok: true, fallback: false,
+    best: { targetIndex: 1, stopIndex: 1, technicalTarget: 103, technicalStop: 98,
+        targetDistance: 3, stopDistance: 2, potentialProfit: 3, potentialLoss: 2 }
+};
+
+test('entry gate evaluates the nine technical and execution conditions', () => {
     const decision = evaluateEntryDecision({
         side: 'long',
-        projection: { ok: true, winner: { direction: 'up', targetBar: 4 } },
-        filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: false },
+        projection: validatedLongProjection,
         atr: 1, roundTripCost: 0.5,
-        openingCost: 0.25, costExcursion: viableExcursion,
-        plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
+        openingCost: 0.25, plan: structuralLongPlan,
+        spread: 0.05, spreadBaseline: 0.05, spreadSampleCount: 20, dataVerified: true
     });
     assert.equal(decision.decision, 'LONG IS VIABLE');
     assert.equal(decision.allowed, true);
+    assert.equal(decision.checks.length, 9);
 });
 
 test('entry gate allows a fully confirmed long setup', () => {
     const decision = evaluateEntryDecision({
         side: 'long',
-        projection: { ok: true, winner: { direction: 'up', targetBar: 3 } },
-        filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: true },
+        projection: validatedLongProjection,
         atr: 1, roundTripCost: 0.5,
-        openingCost: 0.25, costExcursion: viableExcursion,
-        plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
+        openingCost: 0.25, plan: structuralLongPlan,
+        spread: 0.05, spreadBaseline: 0.05, spreadSampleCount: 30, dataVerified: true
     });
     assert.equal(decision.decision, 'LONG IS VIABLE');
     assert.ok(decision.checks.every(check => check.pass));
@@ -122,14 +174,14 @@ test('entry gate allows a fully confirmed long setup', () => {
 test('entry gate rejects an unknown fee instead of treating it as zero', () => {
     const decision = evaluateEntryDecision({
         side: 'long', feeKnown: false,
-        projection: { ok: true, winner: { direction: 'up', targetBar: 2 } },
-        filters: { ok: true, regime: 'trend', direction: 1, volumeAvailable: true, volumeConfirmsLong: true },
+        projection: validatedLongProjection,
         atr: 1, roundTripCost: 0,
-        openingCost: 0, costExcursion: viableExcursion,
-        plan: { ok: true, fallback: false, best: { targetIndex: 1, stopIndex: 1, stopDistance: 1.6, rewardRisk: 2, potentialProfit: 3 } }
+        openingCost: 0, plan: structuralLongPlan,
+        spread: 0.05, spreadBaseline: 0.05, spreadSampleCount: 30, dataVerified: true
     });
     assert.equal(decision.decision, 'NOT VIABLE');
-    assert.equal(decision.checks.find(check => check.key === 'cost').pass, false);
+    assert.equal(decision.checks.find(check => check.key === 'costCoverage').pass, false);
+    assert.equal(decision.checks.find(check => check.key === 'netRiskReward').pass, false);
 });
 
 test('long TP covers percentage and fixed round-trip costs', () => {
@@ -451,6 +503,20 @@ test('Fourier future dispersion widens with forecast distance', () => {
     assert.ok(result.upperBand[0] > result.forecast[0]);
     assert.ok(result.lowerBand[0] < result.forecast[0]);
     assert.ok(result.empiricalCoverage >= 0 && result.empiricalCoverage <= 1);
+});
+
+test('visible Fourier components form a monotonically improving orthogonal reconstruction', () => {
+    const prices = Array.from({ length: 128 }, (_, index) =>
+        100 + index * 0.03 + 3 * Math.sin(2 * Math.PI * index / 32)
+        + 1.5 * Math.sin(2 * Math.PI * index / 11));
+    const result = projectFourierToTargets(prices, 1, { harmonics: 8, horizonBars: 10, minPeriodBars: 6 });
+    assert.equal(result.ok, true);
+    assert.equal(result.displayCumulativeHistories.length, 8);
+    const errors = result.reconstructionDiagnostics.rmseByComponent;
+    for (let index = 1; index < errors.length; index++) {
+        assert.ok(errors[index] <= errors[index - 1] + 1e-10,
+            `component ${index + 1} increased RMSE from ${errors[index - 1]} to ${errors[index]}`);
+    }
 });
 
 test('Fourier projection excludes cycles shorter than its minimum period', () => {

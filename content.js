@@ -37,8 +37,15 @@
     let lastMarketFilters = null;
     let lastTradePlans = null;
     let lastEntryDecision = null;
+    let checklistSide = 'long';
+    let opportunityAlertsEnabled = localStorage.getItem('atr-opportunity-alerts') !== 'false';
+    let opportunityAlertThreshold = Math.max(5, Math.min(9, Number(localStorage.getItem('atr-opportunity-threshold') || 7)));
+    let opportunityAlertCooldownMinutes = Math.max(5, Number(localStorage.getItem('atr-opportunity-cooldown') || 15));
+    const opportunityAlertState = { long: { score: 0, notifiedAt: 0 }, short: { score: 0, notifiedAt: 0 } };
     let lastScannerResults = [];
     let liveCandle = null;
+    let liveEtoroBidCandle = null;
+    let recentSpreads = [];
     const SCANNER_ASSETS = [
         { symbol: 'VOO', yahoo: 'VOO', name: 'S&P 500 ETF' },
         { symbol: 'VT', yahoo: 'VT', name: 'World ETF' },
@@ -189,24 +196,77 @@
     };
 
     const observedEtoroKey = (symbol, timeframe) => `atr-etoro-observed-${symbol}-${timeframe}`;
-    const loadObservedEtoroCandles = (symbol, timeframe) => {
+    const etoroBidCandleKey = (symbol, timeframe) => `atr-etoro-bid-candles-${symbol}-${timeframe}`;
+    const isEtoroHistoryCandle = candle => String(candle?.source || '').startsWith('etoro-');
+    const loadEtoroBidCandles = (symbol, timeframe) => {
         try {
-            const stored = JSON.parse(localStorage.getItem(observedEtoroKey(symbol, timeframe)) || '[]');
-            return stored.filter(candle => Number.isFinite(candle.t) && Number.isFinite(candle.c))
-                .map(candle => ({ ...candle, source: 'etoro-observed', partial: false }));
+            const stored = JSON.parse(localStorage.getItem(etoroBidCandleKey(symbol, timeframe)) || '[]');
+            return stored.filter(candle => Number.isFinite(candle.t)
+                && Number.isFinite(candle.o) && Number.isFinite(candle.h)
+                && Number.isFinite(candle.l) && Number.isFinite(candle.c)
+                && candle.h >= Math.max(candle.o, candle.c)
+                && candle.l <= Math.min(candle.o, candle.c)
+                && candle.coverageRatio >= 0.90 && candle.tickCount >= 10)
+                .map(candle => ({ ...candle, source: 'etoro-bid' }));
         } catch { return []; }
     };
-    const saveObservedEtoroCandle = (symbol, timeframe, candle) => {
-        if (!symbol || !timeframe || !candle || !Number.isFinite(candle.t) || !Number.isFinite(candle.c)) return;
-        const merged = new Map(loadObservedEtoroCandles(symbol, timeframe).map(item => [item.t, item]));
-        merged.set(candle.t, { ...candle, source: 'etoro-observed', partial: false });
-        const compact = [...merged.values()].sort((a, b) => a.t - b.t).slice(-2000);
-        localStorage.setItem(observedEtoroKey(symbol, timeframe), JSON.stringify(compact));
+    const saveEtoroBidCandle = (symbol, timeframe, candle) => {
+        const stored = loadEtoroBidCandles(symbol, timeframe);
+        const merged = new Map(stored.map(item => [item.t, item]));
+        merged.set(candle.t, candle);
+        localStorage.setItem(etoroBidCandleKey(symbol, timeframe), JSON.stringify(
+            [...merged.values()].sort((a, b) => a.t - b.t).slice(-2000)
+        ));
     };
     const mergeObservedEtoroCandles = (proxyCandles, symbol, timeframe) => {
+        // The OHLC text rendered by eToro does not expose the selected candle's
+        // timestamp. It may describe the candle under the mouse pointer rather
+        // than the current candle. Assigning Date.now() to that text corrupted
+        // the time series and occasionally replaced valid proxy candles with
+        // unrelated historical highs/lows. Remove those legacy observations and
+        // keep one internally consistent source for every analytical calculation.
+        localStorage.removeItem(observedEtoroKey(symbol, timeframe));
         const merged = new Map(proxyCandles.map(candle => [candle.t, candle]));
-        loadObservedEtoroCandles(symbol, timeframe).forEach(candle => merged.set(candle.t, candle));
+        loadEtoroBidCandles(symbol, timeframe).forEach(candle => merged.set(candle.t, candle));
         return [...merged.values()].sort((a, b) => a.t - b.t);
+    };
+
+    const recordEtoroBidQuote = (bid, nowMs = Date.now()) => {
+        if (!(bid > 0) || !lastSymbol || !lastTimeframe) return false;
+        const durationSeconds = timeframeToMinutes(lastTimeframe) * 60;
+        if (!(durationSeconds > 0)) return false;
+        const nowSeconds = nowMs / 1000;
+        const bucket = Math.floor(nowSeconds / durationSeconds) * durationSeconds;
+        if (!liveEtoroBidCandle || liveEtoroBidCandle.t !== bucket) {
+            if (liveEtoroBidCandle) {
+                const endGap = liveEtoroBidCandle.t + durationSeconds - liveEtoroBidCandle.lastTick;
+                const observedSpan = liveEtoroBidCandle.lastTick - liveEtoroBidCandle.firstTick;
+                const coverageRatio = Math.max(0, Math.min(1, observedSpan / durationSeconds));
+                const complete = liveEtoroBidCandle.firstTick - liveEtoroBidCandle.t <= durationSeconds * 0.05
+                    && endGap <= durationSeconds * 0.05 && coverageRatio >= 0.90
+                    && liveEtoroBidCandle.tickCount >= 10;
+                if (complete) {
+                    const closed = { ...liveEtoroBidCandle, coverageRatio, partial: false, source: 'etoro-bid' };
+                    saveEtoroBidCandle(lastSymbol, lastTimeframe, closed);
+                    const byTime = new Map(candlesHistory.map(candle => [candle.t, candle]));
+                    byTime.set(closed.t, closed);
+                    candlesHistory = [...byTime.values()].sort((a, b) => a.t - b.t).slice(-7000);
+                    performCalculations(lastTimeframe, lastSymbol);
+                }
+            }
+            liveEtoroBidCandle = {
+                t: bucket, o: bid, h: bid, l: bid, c: bid, v: null,
+                firstTick: nowSeconds, lastTick: nowSeconds, tickCount: 1,
+                partial: true, source: 'etoro-bid-live'
+            };
+            return true;
+        }
+        liveEtoroBidCandle.h = Math.max(liveEtoroBidCandle.h, bid);
+        liveEtoroBidCandle.l = Math.min(liveEtoroBidCandle.l, bid);
+        liveEtoroBidCandle.c = bid;
+        liveEtoroBidCandle.lastTick = nowSeconds;
+        liveEtoroBidCandle.tickCount += 1;
+        return true;
     };
 
 
@@ -411,7 +471,7 @@
                             </select>
                         </label>
                     </div>
-                    <div class="ohlc-title">Latest detected candle</div>
+                    <div class="ohlc-title">OHLC displayed by eToro (selected/hovered candle)</div>
                     <div class="atr-ohlc">
                         O <span id="val-o">-</span> · H <span id="val-h">-</span> · L <span id="val-l">-</span> · C <span id="val-c">-</span>
                     </div>
@@ -433,13 +493,28 @@
                         <summary>Data and model discrepancies</summary>
                         <div id="discrepancy-output">Waiting for comparable prices and model fit…</div>
                     </details>
+                    <details class="entry-checklist-panel" open>
+                        <summary>Trade viability checklist · <b id="entry-checklist-status">WAITING</b></summary>
+                        <div class="entry-checklist-tabs">
+                            <button id="checklist-long" class="atr-btn">LONG</button>
+                            <button id="checklist-short" class="atr-btn">SHORT</button>
+                        </div>
+                        <div class="opportunity-alert-controls">
+                            <label><input id="opportunity-alert-enabled" type="checkbox"> Alert</label>
+                            <label>Notify at <select id="opportunity-alert-threshold"><option>5</option><option>6</option><option selected>7</option><option>8</option><option>9</option></select>/9</label>
+                            <label>Cooldown <select id="opportunity-alert-cooldown"><option>5</option><option>10</option><option selected>15</option><option>30</option></select> min</label>
+                        </div>
+                        <div id="opportunity-alert-banner" class="opportunity-alert-banner">No alert-level setup.</div>
+                        <div id="entry-checklist-output">Waiting for market data and a trade plan…</div>
+                        <div id="indicator-confluence-output" class="indicator-confluence-output">Waiting for indicator confluence…</div>
+                    </details>
                     <div class="unified-controls">
                         <span><span id="f-samples">--</span> candles · <span id="f-tf">--</span></span>
                         <label>Visible candles <select id="history-count"><option>32</option><option>64</option><option selected>128</option></select></label>
                         <label>Projected candles <select id="projection-count"><option>5</option><option>10</option><option selected>20</option><option>30</option><option>40</option></select></label>
                         <label>Price display <select id="chart-price-mode"><option value="candles">OHLC candles</option><option value="close">Close price</option></select></label>
                         <label>Trade side <select id="chart-trade-side"><option value="auto">Auto</option><option value="long">Buy / LONG</option><option value="short">Sell / SHORT</option></select></label>
-                        <span>Fourier harmonics <button id="k-minus" class="atr-btn">−</button><b id="k-count-label">1</b><button id="k-plus" class="atr-btn">+</button></span>
+                        <span>Fourier reconstruction components <button id="k-minus" class="atr-btn">−</button><b id="k-count-label">1</b><button id="k-plus" class="atr-btn">+</button></span>
                         <span>Wavelet levels <button id="w-minus" class="atr-btn">−</button><b id="w-count-label">2</b><button id="w-plus" class="atr-btn">+</button></span>
                     </div>
                     <div class="layer-controls">
@@ -450,10 +525,11 @@
                     </div>
                     <div class="chart-title">Unified price analysis · <b id="fourier-cycle">Loading…</b></div>
                     <div class="unified-legend">
-                        <span class="legend-real">● Historical OHLC (eToro when observed; otherwise adjusted Yahoo proxy)</span>
+                        <span class="legend-real">● Historical BID OHLC (captured eToro candles; adjusted Yahoo proxy only where missing)</span>
                         <span class="legend-fourier-cycles">● Fourier cycles</span>
-                        <span class="legend-fourier-steps">● C1…Cn cumulative spectral fits</span>
-                        <span class="legend-fourier">● Fourier trend + cycles</span>
+                        <span class="legend-fourier-steps">● C1…Cn cumulative orthogonal reconstruction</span>
+                        <span class="legend-fourier-selected">● Selected-component reconstruction</span>
+                        <span class="legend-fourier">● Validated Fourier model</span>
                         <span class="legend-wavelet">● Wavelet</span>
                         <span class="legend-projection">● <b id="projection-legend-count">20</b>-candle projection</span>
                         <span class="legend-band">■ Dispersion</span>
@@ -509,6 +585,9 @@
     document.getElementById('chart-trade-side').value = ['auto', 'long', 'short'].includes(chartTradeSide) ? chartTradeSide : 'auto';
     chartPriceMode = document.getElementById('chart-price-mode').value;
     chartTradeSide = document.getElementById('chart-trade-side').value;
+    document.getElementById('opportunity-alert-enabled').checked = opportunityAlertsEnabled;
+    document.getElementById('opportunity-alert-threshold').value = String(opportunityAlertThreshold);
+    document.getElementById('opportunity-alert-cooldown').value = String(opportunityAlertCooldownMinutes);
     document.getElementById('projection-legend-count').textContent = projectionBars;
     ui.style.setProperty('--panel-width', '960px');
     ui.style.setProperty('--panel-height', '760px');
@@ -611,6 +690,108 @@
         output.innerHTML = renderSide('long') + renderSide('short');
     };
 
+    const renderEntryChecklist = () => {
+        const output = document.getElementById('entry-checklist-output');
+        const status = document.getElementById('entry-checklist-status');
+        const decision = lastEntryDecision?.[checklistSide];
+        if (!output || !status || !decision) return;
+        const passed = decision.checks.filter(check => check.pass).length;
+        status.textContent = decision.allowed ? `OPERATE · ${passed}/9`
+            : !decision.dataVerified ? `DATA UNVERIFIED · ${passed}/9` : `DO NOT OPERATE · ${passed}/9`;
+        status.style.color = decision.allowed ? '#55e8a2' : '#ff7d7d';
+        output.innerHTML = `<div class="entry-check ${decision.dataVerified ? 'pass' : 'fail'}">
+                <b>${decision.dataVerified ? '✓' : '✕'}</b><span>Data fidelity prerequisite</span>
+                <small>${decision.dataDetail}</small>
+            </div>` + decision.checks.map(check => `
+            <div class="entry-check ${check.pass ? 'pass' : 'fail'}">
+                <b>${check.pass ? '✓' : '✕'}</b><span>${check.label}</span>
+                <small>${check.detail || ''}</small>
+            </div>`).join('');
+        document.getElementById('checklist-long')?.classList.toggle('active', checklistSide === 'long');
+        document.getElementById('checklist-short')?.classList.toggle('active', checklistSide === 'short');
+        renderIndicatorConfluence();
+    };
+
+    const renderIndicatorConfluence = () => {
+        const output = document.getElementById('indicator-confluence-output');
+        const decision = lastEntryDecision?.[checklistSide];
+        const confluence = decision?.confluence;
+        if (!output || !confluence) return;
+        const criticalKeys = new Set(['atr', 'netRiskReward', 'costCoverage', 'spread']);
+        const executionReady = decision.dataVerified === true
+            && decision.checks.filter(check => criticalKeys.has(check.key)).every(check => check.pass)
+            && confluence.operable;
+        const price = value => Number.isFinite(value) ? value.toFixed(priceDecimals(value)) : '--';
+        const money = value => Number.isFinite(value) ? `$${value.toFixed(2)}` : '--';
+        const renderIndicator = item => `<div class="confluence-row ${item.pass ? 'pass' : item.available ? 'fail' : 'unavailable'}">
+            <b>${item.pass ? '✓' : item.available ? '✕' : '–'}</b><span>${item.order}. ${item.label}</span><small>${item.detail}</small></div>`;
+        const renderGate = gate => `<div class="confluence-gate ${gate.pass ? 'pass' : 'fail'}"><b>${gate.pass ? '✓' : '✕'}</b><span>${gate.label}</span></div>`;
+        const scaled = confluence.scaledPlans.map(plan => `<tr><td>−$${plan.stopUsd.toFixed(0)}</td><td>${money(plan.netTpUsd)}</td><td>${Number.isFinite(plan.netRewardRisk) ? plan.netRewardRisk.toFixed(2) : '--'}</td><td>${money(plan.investment)}</td></tr>`).join('');
+        output.innerHTML = `<div class="confluence-summary ${executionReady ? 'ready' : confluence.severalMajors || confluence.mixed ? 'watch' : ''}">
+                <b>${executionReady ? 'POSSIBLE OPERATION' : 'NO OPERATION YET'}</b>
+                <span>${confluence.pattern}</span>
+                <small>Major ${confluence.majorPassed}/${confluence.availableMajorCount} · minor ${confluence.minorPassed}/${confluence.availableMinorCount} · weighted ${(confluence.score * 100).toFixed(0)}%</small>
+            </div>
+            <div class="candidate-levels">
+                <span>Entry <b>${price(confluence.entryPrice)}</b></span><span>TP <b>${price(confluence.tpPrice)} · +${money(confluence.potentialProfit)}</b></span>
+                <span>SL <b>${price(confluence.slPrice)} · −${money(confluence.potentialLoss)}</b></span><span>Net R/R <b>${confluence.netRewardRisk.toFixed(2)}</b></span>
+            </div>
+            <h5>Mandatory risk gates</h5><div class="confluence-gates">${confluence.riskGates.map(renderGate).join('')}</div>
+            <details open><summary>Major indicators · weight 2</summary><div class="confluence-list">${confluence.majors.map(renderIndicator).join('')}</div></details>
+            <details><summary>Minor indicators · weight 1</summary><div class="confluence-list">${confluence.minors.map(renderIndicator).join('')}</div></details>
+            <details><summary>Same technical SL scaled to a $1–$3 loss</summary><table class="risk-scale-table"><thead><tr><th>SL</th><th>Net TP</th><th>Net R/R</th><th>Required investment</th></tr></thead><tbody>${scaled}</tbody></table><small>Scaling preserves the technical prices and changes position size. Verify eToro minimum investment before opening.</small></details>`;
+    };
+
+    const evaluateOpportunityAlerts = () => {
+        const banner = document.getElementById('opportunity-alert-banner');
+        if (!lastEntryDecision || !banner) return;
+        const criticalKeys = new Set(['atr', 'netRiskReward', 'costCoverage', 'spread']);
+        const candidates = ['long', 'short'].map(side => {
+            const decision = lastEntryDecision[side];
+            const score = decision?.checks.filter(check => check.pass).length || 0;
+            const failedCritical = decision?.checks.filter(check => criticalKeys.has(check.key) && !check.pass) || [];
+            const actionable = decision?.dataVerified === true && failedCritical.length === 0
+                && decision?.confluence?.operable === true;
+            return { side, decision, score, failedCritical, actionable };
+        }).sort((a, b) => b.score - a.score || Number(b.actionable) - Number(a.actionable));
+        const best = candidates[0];
+        if (!opportunityAlertsEnabled) {
+            banner.className = 'opportunity-alert-banner';
+            banner.textContent = 'Opportunity alerts are disabled.';
+            return;
+        }
+        if (best.score < opportunityAlertThreshold) {
+            banner.className = 'opportunity-alert-banner';
+            banner.textContent = `No alert-level setup · best ${best.side.toUpperCase()} ${best.score}/9 · threshold ${opportunityAlertThreshold}/9`;
+        } else {
+            banner.className = `opportunity-alert-banner ${best.actionable ? 'ready' : 'watch'}`;
+            const reason = !best.decision.dataVerified ? 'market data is not fully verified'
+                : best.failedCritical.length ? `critical failures: ${best.failedCritical.map(check => check.label).join('; ')}`
+                : !best.decision.confluence?.operable ? `indicator confluence: ${best.decision.confluence?.pattern || 'unavailable'}`
+                : 'risk controls and indicator confluence passed';
+            banner.textContent = `${best.actionable ? 'REVIEW FOR ENTRY' : 'WATCH ONLY'} · ${best.side.toUpperCase()} ${best.score}/9 · ${reason}`;
+        }
+        const now = Date.now();
+        candidates.forEach(candidate => {
+            const state = opportunityAlertState[candidate.side];
+            const thresholdReached = candidate.score >= opportunityAlertThreshold;
+            const crossedThreshold = state.score < opportunityAlertThreshold && thresholdReached;
+            const improved = thresholdReached && candidate.score > state.score;
+            const cooldownElapsed = now - state.notifiedAt >= opportunityAlertCooldownMinutes * 60 * 1000;
+            if (thresholdReached && (crossedThreshold || improved || cooldownElapsed)) {
+                const missing = candidate.decision.checks.filter(check => !check.pass).map(check => check.label);
+                const title = `${candidate.actionable ? 'Review entry' : 'Watch only'}: ${lastSymbol} ${candidate.side.toUpperCase()} ${candidate.score}/9`;
+                const message = candidate.actionable
+                    ? `${lastTimeframe.toUpperCase()} setup reached the alert threshold. Review BID/ASK and order levels before trading.`
+                    : `${lastTimeframe.toUpperCase()} majority reached, but do not operate yet. Missing: ${[!candidate.decision.dataVerified ? 'verified eToro history' : null, ...missing].filter(Boolean).slice(0, 3).join('; ')}.`;
+                chrome.runtime.sendMessage({ action: 'showOpportunityNotification', title, message,
+                    symbol: lastSymbol, side: candidate.side }).catch(() => {});
+                state.notifiedAt = now;
+            }
+            state.score = candidate.score;
+        });
+    };
+
     const aggregateScannerCandles = (candles, groupSize = 1) => {
         if (groupSize <= 1) return candles;
         const completeLength = Math.floor(candles.length / groupSize) * groupSize;
@@ -696,8 +877,9 @@
             || b.ranking.opportunityScore - a.ranking.opportunityScore
             || b.passed - a.passed);
         const best = alternatives[0];
-        const fourierPass = best.decision.checks.find(check => check.key === 'fourier')?.pass === true;
-        const category = best.decision.allowed ? 'operate' : best.passed >= 4 && fourierPass ? 'near' : 'avoid';
+        const fourierPass = best.decision.checks.find(check => check.key === 'projectionOrder')?.pass === true;
+        const category = best.decision.allowed ? 'operate'
+            : best.decision.dataVerified && best.passed >= 7 && fourierPass ? 'near' : 'avoid';
         const plan = best.plan.ok ? best.plan.best : null;
         const projectedMove = projection.winner?.direction === (best.side === 'long' ? 'up' : 'down')
             ? projection.winner : null;
@@ -813,8 +995,10 @@
                 historyAlignedToEtoro,
                 historyScaleFactor,
                 historyPriceOffset,
-                observedEtoroCandles: candlesHistory.filter(candle => candle.source === 'etoro-observed').length,
-                historicalProxy: lastSymbol === 'GOLD' ? 'Yahoo GC=F adjusted by additive live basis' : 'Yahoo proxy adjusted by additive live basis'
+                observedEtoroCandles: candlesHistory.filter(candle => candle.source === 'etoro-bid').length,
+                historicalProxy: lastSymbol === 'GOLD'
+                    ? 'Verified eToro BID candles when captured; otherwise Yahoo GC=F adjusted by additive live basis'
+                    : 'Verified eToro BID candles when captured; otherwise adjusted Yahoo proxy'
             },
             chartConfiguration: {
                 visibleHistoricalCandles: visibleHistoryCount,
@@ -864,7 +1048,7 @@
                 close: candle.c,
                 volume: Number.isFinite(candle.v) ? candle.v : null
             })),
-            etoroObservedCandle: liveCandle ? {
+            etoroDisplayedOhlcWithoutVerifiedTimestamp: liveCandle ? {
                 timestamp: liveCandle.t,
                 isoTime: new Date(liveCandle.t * 1000).toISOString(),
                 open: liveCandle.o,
@@ -873,12 +1057,13 @@
                 close: liveCandle.c,
                 volume: Number.isFinite(liveCandle.v) ? liveCandle.v : null,
                 partial: true,
-                excludedFromIndicators: true
+                excludedFromIndicators: true,
+                warning: 'The eToro DOM does not expose the timestamp of this displayed/hovered candle; it is never merged into history.'
             } : null,
             sourceComparison: (() => {
                 const yahooClose = rawYahooCandles.at(-1)?.c;
                 const alignedClose = candlesHistory.at(-1)?.c;
-                const latestAlignedProxy = [...candlesHistory].reverse().find(candle => candle.source !== 'etoro-observed');
+                const latestAlignedProxy = [...candlesHistory].reverse().find(candle => !isEtoroHistoryCandle(candle));
                 const aggregatedYahooClose = Number.isFinite(latestAlignedProxy?.c)
                     ? latestAlignedProxy.c - historyPriceOffset : null;
                 const etoroReference = lastBidPrice && lastAskPrice
@@ -893,11 +1078,11 @@
                     etoroMinusYahoo: compare(yahooClose),
                     etoroMinusAggregatedYahoo: compare(aggregatedYahooClose),
                     etoroMinusPluginAligned: compare(alignedClose),
-                    warning: 'eToro does not expose its complete chart series in the page DOM. Only the observed eToro candle and executable quotes can be exported; historical candles come from Yahoo Finance.'
+                    warning: 'eToro does not expose its complete timestamped chart series in the page DOM. Historical candles are a Yahoo Finance proxy adjusted to the live eToro midpoint and will not exactly reproduce the eToro chart.'
                 };
             })(),
             interpretationWarnings: [
-                'Yahoo quotes may differ from executable eToro prices.',
+                'Only candles marked etoro-bid are built from executable eToro data; remaining history is an adjusted Yahoo proxy.',
                 'The Fourier band uses the historical 90th-percentile validation error; it is empirical but is not a formal confidence interval.',
                 'Costs may exclude overnight financing, slippage, currency conversion and taxes.'
             ]
@@ -931,18 +1116,23 @@
             ? (lastBidPrice + lastAskPrice) / 2
             : (lastBidPrice || lastAskPrice);
         lastPriceSource = 'executable eToro prices';
+        if (lastBidPrice && lastAskPrice) {
+            recentSpreads.push(lastAskPrice - lastBidPrice);
+            if (recentSpreads.length > 300) recentSpreads.shift();
+        }
+        recordEtoroBidQuote(lastBidPrice);
         let historyJustAligned = false;
         if (!historyAlignedToEtoro && candlesHistory.length) {
-            const latestProxy = [...candlesHistory].reverse().find(candle => candle.source !== 'etoro-observed');
+            const latestProxy = [...candlesHistory].reverse().find(candle => !isEtoroHistoryCandle(candle));
             const historicalLast = latestProxy?.c;
             const offset = lastMarketPrice - historicalLast;
             if (Number.isFinite(offset) && Math.abs(offset) < lastMarketPrice * 0.20) {
                 candlesHistory = candlesHistory.map(candle => ({
                     ...candle,
-                    o: candle.source === 'etoro-observed' || !Number.isFinite(candle.o) ? candle.o : candle.o + offset,
-                    h: candle.source === 'etoro-observed' || !Number.isFinite(candle.h) ? candle.h : candle.h + offset,
-                    l: candle.source === 'etoro-observed' || !Number.isFinite(candle.l) ? candle.l : candle.l + offset,
-                    c: candle.source === 'etoro-observed' ? candle.c : candle.c + offset
+                    o: isEtoroHistoryCandle(candle) || !Number.isFinite(candle.o) ? candle.o : candle.o + offset,
+                    h: isEtoroHistoryCandle(candle) || !Number.isFinite(candle.h) ? candle.h : candle.h + offset,
+                    l: isEtoroHistoryCandle(candle) || !Number.isFinite(candle.l) ? candle.l : candle.l + offset,
+                    c: isEtoroHistoryCandle(candle) ? candle.c : candle.c + offset
                 }));
                 historyScaleFactor = 1;
                 historyPriceOffset = offset;
@@ -1293,11 +1483,13 @@
             const fourierStart = Math.max(0, count - fourierCycles.length);
             drawLine(fourierCycles, fourierStart, projection.enabled ? '#4fc3f7' : '#64758a', 1.1, projection.enabled ? [] : [4, 3]);
             const cumulativeColors = ['#38bdf8', '#60a5fa', '#818cf8', '#a78bfa', '#c084fc', '#e879f9', '#f472b6', '#fb7185'];
-            cumulativeHistories.forEach((series, index) => {
+            cumulativeHistories.slice(0, -1).forEach((series, index) => {
                 const retained = projection.displayCycleDirections?.[index]?.retained !== false;
                 drawLine(series, fourierStart, retained ? cumulativeColors[index % cumulativeColors.length] : '#596474',
                     retained ? 0.85 : 0.65, retained ? [2 + index % 3, 3] : [1, 5]);
             });
+            const selectedReconstruction = cumulativeHistories.at(-1);
+            if (selectedReconstruction) drawLine(selectedReconstruction, fourierStart, '#f59e0b', 2.2);
             drawLine(anchoredFourier, fourierStart, projection.enabled ? '#ff5252' : '#8a7580', 1.7, projection.enabled ? [] : [4, 3]);
         }
         drawLine(waveletValues, 0, '#ffb74d', 1.3);
@@ -1321,11 +1513,14 @@
         }
         if (showFourier) {
             const cumulativeColors = ['#38bdf8', '#60a5fa', '#818cf8', '#a78bfa', '#c084fc', '#e879f9', '#f472b6', '#fb7185'];
-            (projection.displayCumulativeForecasts || projection.cumulativeForecasts || []).forEach((series, index) => {
+            const displayedForecasts = projection.displayCumulativeForecasts || projection.cumulativeForecasts || [];
+            displayedForecasts.slice(0, -1).forEach((series, index) => {
                 const retained = projection.displayCycleDirections?.[index]?.retained !== false;
                 drawLine(series, count - 1, retained ? cumulativeColors[index % cumulativeColors.length] : '#596474',
                     retained ? 0.85 : 0.65, retained ? [2, 4] : [1, 5]);
             });
+            const selectedForecast = displayedForecasts.at(-1);
+            if (selectedForecast) drawLine(selectedForecast, count - 1, '#f59e0b', 1.5, [4, 3]);
             drawLine(projection.forecast, count - 1, projection.enabled ? '#e967ff' : '#8f98a6', 2, projection.enabled ? [5, 3] : [2, 5]);
         }
         const drawLevel = (value, color, label, dash) => {
@@ -1583,8 +1778,8 @@
             document.getElementById('fourier-cycle').innerText = !dataFresh
                 ? `Diagnostic only · historical series is ${dataAgeBars.toFixed(1)} candles stale`
                 : futureProjection.enabled
-                ? `Adaptive ${futureProjection.adaptiveWindow} candles · requested ${futureProjection.requestedHarmonics}, retained ${futureProjection.harmonics} · stability ${(futureProjection.stability.score * 100).toFixed(0)}/100`
-                : `Fourier diagnostic only · requested ${futureProjection.requestedHarmonics}, retained ${futureProjection.harmonics}`;
+                ? `Orthogonal reconstruction ${futureProjection.displayCycleDirections.length}/${futureProjection.reconstructionDiagnostics.maximumComponents} components · RMSE ${futureProjection.reconstructionDiagnostics.finalRmse.toFixed(priceDecimals(currentPrice))} · predictive model ${futureProjection.harmonics} cycles · stability ${(futureProjection.stability.score * 100).toFixed(0)}/100`
+                : `Orthogonal reconstruction ${futureProjection.displayCycleDirections.length}/${futureProjection.reconstructionDiagnostics.maximumComponents} components · RMSE ${futureProjection.reconstructionDiagnostics.finalRmse.toFixed(priceDecimals(currentPrice))} · predictive model rejected`;
             document.getElementById('fourier-top-list').innerHTML = (futureProjection.displayCycleDirections || futureProjection.cycleDirections).map((cycle, index) =>
                 `<div class="fourier-cycle-row ${cycle.retained === false ? 'cycle-excluded' : ''}"><div class="fourier-cycle-head"><span>C${index + 1} · f=${cycle.k.toFixed(2)}</span><b>${cycle.period.toFixed(1)}-candle cycle</b><strong class="${cycle.direction === 'up' ? 'cycle-up' : cycle.direction === 'down' ? 'cycle-down' : 'cycle-turning'}">${cycle.direction.toUpperCase()}</strong></div><div class="fourier-cycle-state">${cycle.retained === false ? 'DIAGNOSTIC ONLY · EXCLUDED FROM SIGNAL' : 'RETAINED BY VALIDATION'}</div><div class="fourier-cycle-metrics"><span>Amplitude <b>≈ ${(currentPrice * cycle.amplitude).toFixed(priceDecimals(currentPrice))}</b></span><span>Next contribution <b>${currentPrice * cycle.delta >= 0 ? '+' : ''}${(currentPrice * cycle.delta).toFixed(priceDecimals(currentPrice))}</b></span></div></div>`
             ).join('');
@@ -1604,7 +1799,7 @@
                 <span class="${discrepancyClass(fit.rmseAtr)}">Fourier historical RMSE <b>${fit.rmse.toFixed(priceDecimals(currentPrice))} (${fit.rmseAtr.toFixed(2)} ATR)</b></span>
                 <span class="${discrepancyClass(futureProjection.endpointErrorAtr)}">Fourier endpoint error <b>${futureProjection.endpointError >= 0 ? '+' : ''}${futureProjection.endpointError.toFixed(priceDecimals(currentPrice))} (${futureProjection.endpointErrorAtr.toFixed(2)} ATR)</b></span>
                 <span class="${futureProjection.validationDirectionAccuracy < 0.5 ? 'discrepancy-bad' : futureProjection.validationDirectionAccuracy < 0.6 ? 'discrepancy-warning' : ''}">Validation direction <b>${(futureProjection.validationDirectionAccuracy * 100).toFixed(1)}%</b></span>
-                <span>Historical source <b>${candlesHistory.filter(candle => candle.source === 'etoro-observed').length} eToro / ${candlesHistory.length} candles</b></span>
+                <span class="${sample.filter(candle => candle.source === 'etoro-bid').length >= N ? '' : 'discrepancy-warning'}">Historical source <b>${sample.filter(candle => candle.source === 'etoro-bid').length}/${N} analysis candles verified from eToro BID · remainder adjusted Yahoo proxy</b></span>
                 <span class="${dataFresh ? '' : 'discrepancy-bad'}">Last closed-candle age <b>${dataAgeBars.toFixed(1)} candles · ${(dataAgeSeconds / 60).toFixed(0)} min</b></span>
                 <span>Adaptive model <b>${futureProjection.adaptiveWindow} candles · ${futureProjection.harmonics} harmonics</b></span>
                 <span class="${futureProjection.enabled && dataFresh ? '' : 'discrepancy-bad'}">Projection status <b>${futureProjection.enabled && dataFresh ? 'VALIDATED FOR DISPLAY' : !dataFresh ? 'REJECTED · STALE SERIES' : 'REJECTED · DIAGNOSTIC ONLY'}</b></span>`;
@@ -1626,6 +1821,36 @@
             }, sample);
             drawFourierForecast(futureProjection, atrValue, longTarget, shortTarget, timeframeMinutes);
             const filters = window.EToroAnalytics.analyzeMarketFilters(candlesHistory.slice(-200));
+            const sortedSpreads = recentSpreads.filter(Number.isFinite).sort((a, b) => a - b);
+            const middleSpread = Math.floor(sortedSpreads.length / 2);
+            const spreadBaseline = sortedSpreads.length
+                ? (sortedSpreads.length % 2 ? sortedSpreads[middleSpread]
+                    : (sortedSpreads[middleSpread - 1] + sortedSpreads[middleSpread]) / 2)
+                : NaN;
+            const currentSpread = lastBidPrice && lastAskPrice ? lastAskPrice - lastBidPrice : NaN;
+            const exposure = investment * leverage;
+            const openingCost = fee.known ? exposure * fee.openFeePercent / 100 : 0;
+            const roundTripCost = fee.known ? exposure * (fee.openFeePercent + fee.closeFeePercent) / 100 : 0;
+            const verifiedEtoroCandles = sample.filter(candle => candle.source === 'etoro-bid').length;
+            const decisionOptions = { projection: futureProjection, feeKnown: fee.known, atr: atrValue,
+                atrMultiple: 1, openingCost, roundTripCost, spread: currentSpread,
+                spreadBaseline, spreadSampleCount: sortedSpreads.length,
+                dataVerified: verifiedEtoroCandles === sample.length,
+                dataDetail: `${verifiedEtoroCandles}/${sample.length} model candles captured from eToro BID; Yahoo fills the remainder` };
+            const buildDecision = (side, plan) => {
+                const decision = window.EToroAnalytics.evaluateEntryDecision({ ...decisionOptions, side, plan });
+                decision.confluence = window.EToroAnalytics.analyzeTechnicalConfluence({
+                    side, plan, projection: futureProjection, filters, entryChecks: decision.checks,
+                    roundTripCost, investment, minimumStopUsd: 1, maximumStopUsd: 3
+                });
+                return decision;
+            };
+            lastEntryDecision = { long: buildDecision('long', longPlan), short: buildDecision('short', shortPlan) };
+            if (chartTradeSide === 'long' || chartTradeSide === 'short') checklistSide = chartTradeSide;
+            else if (consensusSign > 0) checklistSide = 'long';
+            else if (consensusSign < 0) checklistSide = 'short';
+            renderEntryChecklist();
+            evaluateOpportunityAlerts();
             const vwapEl = document.getElementById('metric-vwap');
             vwapEl.textContent = filters.ok && Number.isFinite(filters.vwap)
                 ? filters.vwap.toFixed(priceDecimals(filters.vwap)) : 'Unavailable';
@@ -1666,6 +1891,7 @@
             console.log(`%c[ATR] 🔄 Change detected: ${lastSymbol} -> ${symbol} (${timeframe})`, "color: yellow");
             isSyncing = true;
             candlesHistory = []; rawYahooCandles = []; lastBarTime = 0; lastClose = null; liveCandle = null;
+            liveEtoroBidCandle = null; recentSpreads = [];
             lastTimeframe  = timeframe; lastSymbol = symbol;
             lastMarketPrice = null; lastPriceSource = 'Yahoo Finance';
             lastBidPrice = null; lastAskPrice = null;
@@ -1730,15 +1956,9 @@
             const currentBarTime = Math.floor(now / barDuration) * barDuration;
 
             if (!liveCandle || currentBarTime > liveCandle.t * 1000) {
-                // Only the previous partial candle can become a closed candle.
-                // Keep the current-period candle separate so it cannot contaminate
-                // ATR, Fourier, Wavelet, volume or calibration.
-                if (liveCandle && (!candlesHistory.length || liveCandle.t > candlesHistory.at(-1).t)) {
-                    const closedEtoroCandle = { ...liveCandle, partial: false, source: 'etoro-observed' };
-                    candlesHistory.push(closedEtoroCandle);
-                    saveObservedEtoroCandle(symbol, timeframe, closedEtoroCandle);
-                    if (candlesHistory.length > 5000) candlesHistory.shift();
-                }
+                // Do not append the displayed OHLC to history. Without a timestamp
+                // eToro may be showing the candle selected by the crosshair, so it
+                // cannot safely replace a candle in the analytical series.
                 liveCandle = {
                     t: Math.floor(currentBarTime / 1000),
                     o: Number.isFinite(data.Open) ? data.Open : data.Close,
@@ -1863,7 +2083,7 @@
     });
 
     document.getElementById('k-plus').addEventListener('click', () => {
-        if (visibleCyclesCount < 12) {
+        if (visibleCyclesCount < 32) {
             visibleCyclesCount++;
             document.getElementById('k-count-label').innerText = visibleCyclesCount;
             const { symbol } = getMetadata();
@@ -1917,6 +2137,30 @@
         chartTradeSide = event.target.value;
         localStorage.setItem('atr-plugin-chart-side', chartTradeSide);
         performCalculations(lastTimeframe, lastSymbol);
+    });
+    document.getElementById('checklist-long').addEventListener('click', () => {
+        checklistSide = 'long';
+        renderEntryChecklist();
+    });
+    document.getElementById('checklist-short').addEventListener('click', () => {
+        checklistSide = 'short';
+        renderEntryChecklist();
+    });
+    document.getElementById('opportunity-alert-enabled').addEventListener('change', event => {
+        opportunityAlertsEnabled = event.target.checked;
+        localStorage.setItem('atr-opportunity-alerts', String(opportunityAlertsEnabled));
+        evaluateOpportunityAlerts();
+    });
+    document.getElementById('opportunity-alert-threshold').addEventListener('change', event => {
+        opportunityAlertThreshold = Number(event.target.value);
+        localStorage.setItem('atr-opportunity-threshold', String(opportunityAlertThreshold));
+        opportunityAlertState.long.score = 0;
+        opportunityAlertState.short.score = 0;
+        evaluateOpportunityAlerts();
+    });
+    document.getElementById('opportunity-alert-cooldown').addEventListener('change', event => {
+        opportunityAlertCooldownMinutes = Number(event.target.value);
+        localStorage.setItem('atr-opportunity-cooldown', String(opportunityAlertCooldownMinutes));
     });
     ['show-fourier', 'show-atr', 'show-tp', 'show-sl'].forEach(id => {
         document.getElementById(id).addEventListener('change', () => performCalculations(lastTimeframe, lastSymbol));
@@ -1975,6 +2219,8 @@
         candlesHistory = [];
         rawYahooCandles = [];
         liveCandle = null;
+        liveEtoroBidCandle = null;
+        recentSpreads = [];
         lastBarTime = 0;
         lastClose = null;
         lastMarketPrice = null;

@@ -155,6 +155,7 @@
 .legend-real { color: #00e676; }
 .legend-fourier-cycles { color: #4fc3f7; }
 .legend-fourier-steps { color: #7dd3fc; }
+.legend-fourier-selected { color: #f59e0b; }
 .legend-fourier { color: #ff5252; }
 .legend-wavelet { color: #ffb74d; }
 .legend-projection { color: #e967ff; }
@@ -163,6 +164,39 @@
 .legend-tp { color: #55e8a2; }
 .legend-sl { color: #ff7d7d; }
 .legend-market { color: #dbeafe; }
+.entry-checklist-panel { border: 1px solid #3b4658; border-radius: 6px; padding: 7px 9px; background: #151c29; }
+.entry-checklist-panel summary { cursor: pointer; color: #dbe7f7; }
+.entry-checklist-tabs { display: flex; gap: 6px; margin: 8px 0; }
+.opportunity-alert-controls { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 5px 0; color: #a9b5c4; font-size: 10px; }
+.opportunity-alert-controls label { display: inline-flex !important; align-items: center; gap: 4px; }
+.opportunity-alert-controls select { width: 45px !important; height: 22px !important; margin: 0 !important; }
+.opportunity-alert-banner { margin: 5px 0 7px; padding: 6px 8px; border-radius: 5px; color: #93a0b1; background: #202735; font-size: 10px; }
+.opportunity-alert-banner.watch { color: #ffd166; background: rgba(255,209,102,.09); }
+.opportunity-alert-banner.ready { color: #55e8a2; background: rgba(85,232,162,.10); }
+#entry-checklist-output { display: grid; gap: 4px; }
+.entry-check { display: grid; grid-template-columns: 18px minmax(0,1fr); gap: 7px; align-items: start; padding: 4px 6px; border-radius: 4px; background: rgba(255,255,255,.025); font-size: 12px; }
+.entry-check.pass { color: #73e8aa; }
+.entry-check.fail { color: #ff8c8c; }
+.entry-check small { grid-column: 2; color: #8e9aae; }
+.indicator-confluence-output { display: grid; gap: 7px; margin-top: 9px; padding-top: 8px; border-top: 1px solid #394456; }
+.confluence-summary { display: grid; gap: 2px; padding: 7px; border-radius: 5px; color: #aab5c3; background: #202735; }
+.confluence-summary.ready { color: #55e8a2; background: rgba(85,232,162,.10); }
+.confluence-summary.watch { color: #ffd166; background: rgba(255,209,102,.09); }
+.confluence-summary small { color: #8592a3; }
+.candidate-levels { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 4px 10px; padding: 6px; border: 1px solid #384456; border-radius: 5px; color: #929eae; }
+.candidate-levels span { display: flex; justify-content: space-between; gap: 5px; }
+.candidate-levels b { color: #e2e9f1; }
+.indicator-confluence-output h5 { margin: 2px 0 0; color: #cbd6e3; }
+.confluence-gates,.confluence-list { display: grid; gap: 3px; }
+.confluence-gate,.confluence-row { display: grid; grid-template-columns: 16px minmax(0,1fr); gap: 5px; padding: 4px 5px; border-radius: 4px; background: rgba(255,255,255,.025); }
+.confluence-gate.pass,.confluence-row.pass { color: #64dda0; }
+.confluence-gate.fail,.confluence-row.fail { color: #ff8585; }
+.confluence-row.unavailable { color: #758092; }
+.confluence-row small { grid-column: 2; color: #8491a2; }
+.indicator-confluence-output details summary { cursor: pointer; color: #b7c5d6; font-weight: 700; }
+.risk-scale-table { width: 100%; margin-top: 5px; border-collapse: collapse; color: #aeb9c7; }
+.risk-scale-table th,.risk-scale-table td { padding: 4px; border-bottom: 1px solid #354052; text-align: right; }
+.risk-scale-table th:first-child,.risk-scale-table td:first-child { text-align: left; }
 #unified-analysis-canvas {
     display: block;
     width: 100%;
